@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabaseClient'
 import { forecastSales } from '../lib/mlEngine'
 import {
-  AreaChart, Area, BarChart, Bar, LineChart, Line,
-  ScatterChart, Scatter, Treemap,
+  AreaChart, Area, LineChart, Line,
+  ScatterChart, Scatter,
   XAxis, YAxis, ZAxis, Tooltip, ResponsiveContainer,
   CartesianGrid, Legend, Cell, ReferenceLine
 } from 'recharts'
@@ -13,29 +13,6 @@ import {
   CheckCircle, Eye
 } from 'lucide-react'
 
-function TreemapContent(props: any) {
-  const { x, y, width, height, name, value, color } = props
-  if (!width || !height || width < 2 || height < 2) return null
-  return (
-    <g>
-      <rect x={x} y={y} width={width} height={height}
-        style={{ fill: color || '#6C63FF', fillOpacity: 0.72, stroke: 'rgba(10,12,25,0.8)', strokeWidth: 2 }} />
-      {width > 55 && height > 28 && (
-        <text x={x + width / 2} y={y + height / 2 - (height > 50 ? 7 : 0)}
-          textAnchor="middle" fill="#fff" fontSize={Math.min(11, Math.max(8, width / 9))}
-          fontWeight={600} dominantBaseline="middle">
-          {name?.length > 13 ? name.slice(0, 11) + '…' : name}
-        </text>
-      )}
-      {width > 65 && height > 50 && (
-        <text x={x + width / 2} y={y + height / 2 + 10}
-          textAnchor="middle" fill="rgba(255,255,255,0.55)" fontSize={Math.min(10, Math.max(7, width / 11))}>
-          ${(value / 1000).toFixed(1)}K
-        </text>
-      )}
-    </g>
-  )
-}
 
 export default function SalesForecast() {
   // Tab control
@@ -459,8 +436,6 @@ export default function SalesForecast() {
   }
 
   // ── Chart data derivations ──────────────────────────────────────
-  const CHART_COLORS = ['#6C63FF','#22d3a8','#00D4FF','#f59e0b','#a78bfa','#f43f5e','#FF6B9D','#34d399','#38bdf8','#fb923c']
-
   const bubbleChartData = productForecasts.map((f: any) => ({
     x: f.current_stock_live,
     y: f.total_forecasted_demand,
@@ -470,31 +445,12 @@ export default function SalesForecast() {
     fill: f.urgency === 'CRITICAL' ? '#f43f5e' : f.urgency === 'HIGH' ? '#f59e0b' : f.urgency === 'MEDIUM' ? '#00D4FF' : '#22d3a8',
   }))
 
-  const familyBreakdown: { family: string; demand: number }[] = (() => {
-    const map: Record<string, number> = {}
-    productForecasts.forEach((f: any) => {
-      const fam = f.family || 'Other'
-      map[fam] = (map[fam] || 0) + (f.total_forecasted_demand || 0)
-    })
-    return Object.entries(map)
-      .map(([family, demand]) => ({ family, demand }))
-      .sort((a, b) => b.demand - a.demand)
-      .slice(0, 8)
-  })()
-
-  const treemapData = productForecasts
-    .filter((f: any) => (f.forecasted_revenue || 0) > 0)
-    .map((f: any, i: number) => ({ name: f.product_name, value: f.forecasted_revenue, color: CHART_COLORS[i % CHART_COLORS.length] }))
-    .sort((a: any, b: any) => b.value - a.value)
-    .slice(0, 12)
-
-  const oilSentimentData = historyForecasts
-    .filter((f: any) => f.oil_price_used && parseFloat(f.oil_price_used) > 0)
-    .map((f: any) => ({
-      oil: parseFloat(f.oil_price_used),
-      sentiment: parseFloat(f.sentiment_multiplier) || 1.0,
-      name: f.product_name,
-    }))
+  const sentimentReorderData = historyForecasts.map((f: any) => ({
+    sentiment: parseFloat(f.sentiment_multiplier) || 1.0,
+    reorder: f.optimal_reorder_qty || 0,
+    name: f.product_name,
+    fill: parseFloat(f.sentiment_multiplier) > 1.02 ? '#22d3a8' : parseFloat(f.sentiment_multiplier) < 0.98 ? '#f43f5e' : '#6C63FF',
+  }))
 
   return (
     <div className="page-enter">
@@ -787,109 +743,53 @@ export default function SalesForecast() {
                   </div>
                 </div>
 
-                {/* Chart 4: Product Family Demand Breakdown */}
+                {/* Chart 6: Sentiment vs PPO Reorder Decision */}
                 <div className="glass-card">
                   <div className="section-title">
-                    Product Family Demand
-                    <span className="badge badge-accent" style={{ fontSize: 10 }}>Total Forecasted Units</span>
+                    Sentiment vs Reorder Decision
+                    <span className="badge badge-accent" style={{ fontSize: 10 }}>LLM Signal → PPO Action</span>
                   </div>
                   <div style={{ height: 260 }}>
                     <ResponsiveContainer width="100%" height="100%">
-                      <BarChart layout="vertical" data={familyBreakdown} margin={{ top: 5, right: 20, bottom: 5, left: 5 }}>
-                        <CartesianGrid horizontal={false} stroke="rgba(255,255,255,0.04)" />
-                        <XAxis type="number" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} />
-                        <YAxis type="category" dataKey="family" width={110}
-                          tick={{ fill: 'rgba(255,255,255,0.6)', fontSize: 10 }} axisLine={false} tickLine={false} />
-                        <Tooltip
-                          contentStyle={{ background: 'rgba(10,12,25,0.92)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10 }}
-                          formatter={(v: any) => [`${v} units`, 'Forecasted Demand']} />
-                        <Bar dataKey="demand" radius={[0, 4, 4, 0]}>
-                          {familyBreakdown.map((_: any, i: number) => (
-                            <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
+                      <ScatterChart margin={{ top: 10, right: 20, bottom: 30, left: 10 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+                        <XAxis type="number" dataKey="sentiment" name="Sentiment"
+                          domain={[0.7, 1.3]}
+                          label={{ value: 'LLM Sentiment Multiplier', position: 'insideBottom', offset: -15, fill: 'rgba(255,255,255,0.3)', fontSize: 10 }}
+                          tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false}
+                          tickFormatter={(v: number) => `x${v.toFixed(2)}`} />
+                        <YAxis type="number" dataKey="reorder" name="Reorder Qty"
+                          label={{ value: 'PPO Reorder Qty', angle: -90, position: 'insideLeft', fill: 'rgba(255,255,255,0.3)', fontSize: 10 }}
+                          tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <ZAxis range={[50, 50]} />
+                        <Tooltip content={(props: any) => {
+                          if (!props.active || !props.payload?.length) return null
+                          const d = props.payload[0]?.payload
+                          return (
+                            <div style={{ padding: 10, background: 'rgba(10,12,25,0.95)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8 }}>
+                              <div style={{ fontWeight: 700, color: '#fff', marginBottom: 4 }}>{d?.name}</div>
+                              <div style={{ fontSize: 11, color: '#00D4FF' }}>Sentiment: <strong>x{d?.sentiment?.toFixed(3)}</strong></div>
+                              <div style={{ fontSize: 11, color: '#22d3a8' }}>PPO Reorder: <strong>+{d?.reorder} units</strong></div>
+                            </div>
+                          )
+                        }} />
+                        <ReferenceLine x={1.0} stroke="rgba(255,255,255,0.2)" strokeDasharray="4 4"
+                          label={{ value: 'Neutral', position: 'insideTopRight', fill: 'rgba(255,255,255,0.3)', fontSize: 9 }} />
+                        <Scatter data={sentimentReorderData} name="Pipeline Runs">
+                          {sentimentReorderData.map((entry: any, i: number) => (
+                            <Cell key={i} fill={entry.fill} fillOpacity={0.8} />
                           ))}
-                        </Bar>
-                      </BarChart>
+                        </Scatter>
+                      </ScatterChart>
                     </ResponsiveContainer>
                   </div>
-                </div>
-              </div>
-
-              {/* Row 2: Revenue Treemap + Oil vs Sentiment */}
-              <div className="grid-12" style={{ marginBottom: 16 }}>
-
-                {/* Chart 5: Revenue Contribution Treemap */}
-                <div className="glass-card">
-                  <div className="section-title">
-                    Revenue Contribution by Product
-                    <span className="badge badge-accent" style={{ fontSize: 10 }}>Forecasted Revenue</span>
+                  <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 6 }}>
+                    {[['#22d3a8','Positive (>x1.02)'],['#f43f5e','Negative (<x0.98)'],['#6C63FF','Neutral']].map(([c,l]) => (
+                      <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: 'rgba(255,255,255,0.5)' }}>
+                        <div style={{ width: 8, height: 8, borderRadius: '50%', background: c }} />{l}
+                      </div>
+                    ))}
                   </div>
-                  {treemapData.length > 0 ? (
-                    <div style={{ height: 260 }}>
-                      <ResponsiveContainer width="100%" height="100%">
-                        <Treemap
-                          data={treemapData}
-                          dataKey="value"
-                          aspectRatio={4 / 3}
-                          stroke="rgba(10,12,25,0.7)"
-                          content={<TreemapContent />}
-                        />
-                      </ResponsiveContainer>
-                    </div>
-                  ) : (
-                    <div style={{ height: 260, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--clr-text-muted)', fontSize: 13 }}>
-                      Revenue data requires product unit prices in Supabase.
-                    </div>
-                  )}
-                </div>
-
-                {/* Chart 6: Oil Price vs Sentiment Scatter */}
-                <div className="glass-card">
-                  <div className="section-title">
-                    Oil Price vs Market Sentiment
-                    <span className="badge badge-accent" style={{ fontSize: 10 }}>Per Pipeline Run</span>
-                  </div>
-                  {oilSentimentData.length > 0 ? (
-                    <div style={{ height: 260 }}>
-                      <ResponsiveContainer width="100%" height="100%">
-                        <ScatterChart margin={{ top: 10, right: 20, bottom: 30, left: 10 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
-                          <XAxis type="number" dataKey="oil" name="Oil Price"
-                            label={{ value: 'WTI Oil ($/bbl)', position: 'insideBottom', offset: -15, fill: 'rgba(255,255,255,0.3)', fontSize: 10 }}
-                            tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} domain={['auto', 'auto']} />
-                          <YAxis type="number" dataKey="sentiment" name="Sentiment" domain={[0.7, 1.3]}
-                            tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false}
-                            tickFormatter={(v: number) => `x${v.toFixed(1)}`} />
-                          <ZAxis range={[50, 50]} />
-                          <Tooltip content={(props: any) => {
-                            if (!props.active || !props.payload?.length) return null
-                            const d = props.payload[0]?.payload
-                            return (
-                              <div style={{ padding: 10, background: 'rgba(10,12,25,0.95)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8 }}>
-                                <div style={{ fontWeight: 700, color: '#fff', marginBottom: 4 }}>{d?.name}</div>
-                                <div style={{ fontSize: 11, color: '#f59e0b' }}>Oil: ${d?.oil?.toFixed(2)}/bbl</div>
-                                <div style={{ fontSize: 11, color: '#22d3a8' }}>Sentiment: x{d?.sentiment?.toFixed(3)}</div>
-                              </div>
-                            )
-                          }} />
-                          <ReferenceLine y={1.0} stroke="rgba(255,255,255,0.2)" strokeDasharray="4 4"
-                            label={{ value: 'Neutral', position: 'right', fill: 'rgba(255,255,255,0.3)', fontSize: 9 }} />
-                          <ReferenceLine x={90} stroke="rgba(244,63,94,0.3)" strokeDasharray="4 4"
-                            label={{ value: '$90', position: 'insideTopRight', fill: 'rgba(244,63,94,0.6)', fontSize: 9 }} />
-                          <ReferenceLine x={65} stroke="rgba(34,211,168,0.3)" strokeDasharray="4 4"
-                            label={{ value: '$65', position: 'insideTopLeft', fill: 'rgba(34,211,168,0.6)', fontSize: 9 }} />
-                          <Scatter data={oilSentimentData} fill="#f59e0b" fillOpacity={0.8} />
-                        </ScatterChart>
-                      </ResponsiveContainer>
-                    </div>
-                  ) : (
-                    <div style={{ height: 260, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, color: 'var(--clr-text-muted)', fontSize: 13, textAlign: 'center', padding: '0 20px' }}>
-                      <div>Accumulates over pipeline runs.</div>
-                      <div style={{ fontSize: 11 }}>Run the SQL below in Supabase, then re-run the pipeline:</div>
-                      <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.06)', padding: '6px 10px', borderRadius: 6, color: '#a78bfa' }}>
-                        ALTER TABLE demand_forecasts ADD COLUMN IF NOT EXISTS oil_price_used FLOAT;
-                      </code>
-                    </div>
-                  )}
                 </div>
               </div>
             </>
