@@ -394,14 +394,16 @@ export default function SalesForecast() {
 
   async function handleDeleteAll() {
     if (!window.confirm('Delete ALL prediction history? This cannot be undone.')) return
+    const ids = predictionHistory.map((r: any) => r.id).filter(Boolean)
+    if (ids.length === 0) return
     setDeletingAll(true)
     try {
-      const { error } = await supabase.from('demand_forecasts').delete().not('id', 'is', null)
+      const { error } = await supabase.from('demand_forecasts').delete().in('id', ids)
       if (!error) {
         setPredictionHistory([])
         setInspectedRow(null)
         fetchDashboardIntelligence()
-        setSuccessToast('All prediction history cleared.')
+        setSuccessToast(`Cleared ${ids.length} prediction log${ids.length !== 1 ? 's' : ''}.`)
       } else {
         setErrorToast(`Clear failed: ${error.message}`)
       }
