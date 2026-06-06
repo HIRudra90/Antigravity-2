@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabaseClient'
 import { forecastSales } from '../lib/mlEngine'
 import {
-  AreaChart, Area, BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip,
-  ResponsiveContainer, CartesianGrid, Legend, Cell, ReferenceLine
+  AreaChart, Area, LineChart, Line, XAxis, YAxis, Tooltip,
+  ResponsiveContainer, CartesianGrid, Legend
 } from 'recharts'
 import {
   TrendingUp, Target, Zap, AlertCircle, BarChart2,
@@ -43,7 +43,6 @@ export default function SalesForecast() {
 
   // Dashboard intelligence state (real data from demand_forecasts)
   const [productForecasts, setProductForecasts] = useState<any[]>([])
-  const [sentimentHistoryData, setSentimentHistoryData] = useState<any[]>([])
   const [stockActions, setStockActions] = useState<any[]>([])
   const [dashLoading, setDashLoading] = useState<boolean>(true)
   const [dashStats, setDashStats] = useState({
@@ -253,15 +252,6 @@ export default function SalesForecast() {
         productsNeedingRestock: enriched.filter((f: any) => (f.optimal_reorder_qty || 0) > 0).length,
       })
 
-      // Sentiment history (last 20 runs, oldest→newest for chart)
-      const sentHist = [...allForecasts].slice(0, 20).reverse().map((f: any) => ({
-        date: new Date(f.predicted_at).toLocaleDateString('en', { month: 'short', day: 'numeric' }),
-        multiplier: parseFloat(f.sentiment_multiplier) || 1.0,
-        product: (f.product_name || '').split(' ')[0],
-        fill: parseFloat(f.sentiment_multiplier) > 1.02 ? '#22d3a8'
-            : parseFloat(f.sentiment_multiplier) < 0.98 ? '#f43f5e' : '#6C63FF',
-      }))
-      setSentimentHistoryData(sentHist)
 
       // Stock action recommendations
       const urgencyOrder: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 }
@@ -603,43 +593,6 @@ export default function SalesForecast() {
             </div>
           </div>
 
-          {/* ── SENTIMENT HISTORY CHART ── */}
-          {sentimentHistoryData.length > 0 ? (
-            <div className="glass-card" style={{ marginBottom: 16 }}>
-              <div className="section-title">
-                LLM Sentiment History — All Pipeline Runs
-                <span className="badge badge-accent" style={{ fontSize: 10 }}>Oil + Holidays + News</span>
-              </div>
-              <div style={{ height: 190 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={sentimentHistoryData} barCategoryGap="30%">
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
-                    <XAxis dataKey="date" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <YAxis domain={[0.7, 1.3]} tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `x${v.toFixed(1)}`} />
-                    <Tooltip
-                      contentStyle={{ background: 'rgba(10,12,25,0.92)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10 }}
-                      formatter={(v: any) => [`x${parseFloat(v).toFixed(3)}`, 'Demand Multiplier']}
-                      labelFormatter={(l: any, p: any) => `${l} — ${p?.[0]?.payload?.product || ''}`}
-                    />
-                    <ReferenceLine y={1.0} stroke="rgba(255,255,255,0.25)" strokeDasharray="4 4" label={{ value: 'Neutral', position: 'right', fill: 'rgba(255,255,255,0.3)', fontSize: 10 }} />
-                    <Bar dataKey="multiplier" name="Sentiment Multiplier" radius={[3, 3, 0, 0]}>
-                      {sentimentHistoryData.map((entry, i) => (
-                        <Cell key={i} fill={entry.fill} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          ) : (
-            <div className="glass-card" style={{ marginBottom: 16, textAlign: 'center', padding: '30px', borderStyle: 'dashed', borderColor: 'rgba(255,255,255,0.08)' }}>
-              <Activity size={28} color="rgba(255,255,255,0.2)" style={{ marginBottom: 10 }} />
-              <div style={{ color: 'var(--clr-text-muted)', fontSize: 13 }}>
-                Sentiment history will appear here after running the pipeline. Switch to <strong style={{ color: '#fff' }}>Interactive Predictor</strong> and run your first analysis.
-              </div>
-            </div>
-          )}
-
           {/* ── ALL PRODUCTS AI STATUS TABLE ── */}
           {productForecasts.length > 0 ? (
             <div className="glass-card" style={{ marginBottom: 16 }}>
@@ -770,7 +723,6 @@ export default function SalesForecast() {
                 { name: 'XGBoost Demand Forecast', value: 94.2, color: '#6C63FF', sub: 'RMSLE accuracy on Ecuador store test set' },
                 { name: 'LLM Sentiment (OpenRouter)', value: Math.min(98, Math.round(Math.abs(dashStats.avgSentiment - 1.0) * 200 + 72)), color: '#00D4FF', sub: 'GPT-4o-mini structured market signal precision' },
                 { name: 'PPO Reinforcement Agent', value: 87, color: '#22d3a8', sub: 'Inventory cost-to-service efficiency score' },
-                { name: 'Combined Pipeline', value: 91.4, color: '#FF6B9D', sub: 'End-to-end forecast + reorder quality' },
               ].map(m => (
                 <div key={m.name} style={{ marginBottom: 16 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 3 }}>
