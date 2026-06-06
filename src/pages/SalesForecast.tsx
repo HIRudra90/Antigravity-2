@@ -436,33 +436,46 @@ export default function SalesForecast() {
     fill: f.urgency === 'CRITICAL' ? '#f43f5e' : f.urgency === 'HIGH' ? '#f59e0b' : f.urgency === 'MEDIUM' ? '#00D4FF' : '#22d3a8',
   }))
 
-  // Sentiment vs Reorder — ALL pipeline runs, one dot per run, colored by product
+  // Sentiment vs Reorder — ALL pipeline runs + ALL products (grey if never run)
   const SCATTER_COLORS = ['#22d3a8','#6C63FF','#f59e0b','#f43f5e','#00D4FF','#a78bfa','#FF6B9D','#34d399','#fb923c','#38bdf8']
   const sentimentReorderData = (() => {
     const colorMap: Record<string, string> = {}
     let idx = 0
-    return historyForecasts.map((f: any) => {
+    // All historical pipeline runs
+    const withData = historyForecasts.map((f: any) => {
       const name = f.product_name || 'Unknown'
       if (!colorMap[name]) colorMap[name] = SCATTER_COLORS[idx++ % SCATTER_COLORS.length]
-      return {
-        sentiment: parseFloat(f.sentiment_multiplier) || 1.0,
-        reorder: f.optimal_reorder_qty || 0,
-        name,
-        fill: colorMap[name],
-      }
+      return { sentiment: parseFloat(f.sentiment_multiplier) || 1.0, reorder: f.optimal_reorder_qty || 0, name, fill: colorMap[name], hasData: true }
     })
+    // Products that exist but have never been run through the pipeline
+    const runNames = new Set(historyForecasts.map((f: any) => f.product_name))
+    const withoutData = products
+      .filter((p: any) => !runNames.has(p.name))
+      .map((p: any) => ({ sentiment: 1.0, reorder: 0, name: p.name, fill: 'rgba(255,255,255,0.25)', hasData: false }))
+    return [...withData, ...withoutData]
   })()
 
-  // Unique products for scatter legend
-  const scatterLegend = Object.entries(
-    sentimentReorderData.reduce((acc: Record<string, string>, d: any) => {
-      if (!acc[d.name]) acc[d.name] = d.fill
-      return acc
-    }, {})
-  )
+  // Scatter legend: pipeline-run products (coloured) + indicator for unrun products
+  const scatterLegend = [
+    ...Object.entries(
+      sentimentReorderData.filter((d: any) => d.hasData).reduce((acc: Record<string, string>, d: any) => {
+        if (!acc[d.name]) acc[d.name] = d.fill
+        return acc
+      }, {})
+    ),
+    ...(sentimentReorderData.some((d: any) => !d.hasData)
+      ? [['No pipeline run yet', 'rgba(255,255,255,0.25)'] as [string, string]]
+      : []
+    ),
+  ]
 
-  // Line chart — actual sales + XGBoost base + PPO/LLM adjusted (3 lines)
+  // Line chart — actual sales (historical) + XGBoost base + PPO+LLM adjusted
+  // Forecast starts from the month right after the last actual data point
   const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+  const currentMonthName = MONTHS[new Date().getMonth()]
+  const lastActualIdx = predictionData.length > 0
+    ? MONTHS.indexOf(predictionData[predictionData.length - 1].month)
+    : new Date().getMonth() - 1
   const xgboostBaseMonthly = productForecasts.reduce((sum: number, f: any) => {
     const base = (f.daily_demand || 0) / (parseFloat(f.sentiment_multiplier) || 1.0)
     return sum + base * (f.unit_price || 0) * 30
@@ -473,8 +486,8 @@ export default function SalesForecast() {
   const combinedChartData = [
     ...predictionData.map((d: any) => ({ ...d, xgboost: null as number | null, adjusted: null as number | null })),
     ...(productForecasts.length > 0 && sentimentAdjustedMonthly > 0
-      ? [1, 2, 3].map(offset => ({
-          month: MONTHS[(new Date().getMonth() + offset) % 12],
+      ? [1, 2, 3, 4, 5].map(offset => ({
+          month: MONTHS[(lastActualIdx + offset) % 12],
           actual: null as number | null,
           xgboost: xgboostBaseMonthly > 0 ? Math.round(xgboostBaseMonthly) : null as number | null,
           adjusted: Math.round(sentimentAdjustedMonthly),
@@ -580,6 +593,8 @@ export default function SalesForecast() {
                     <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={v => `$${Math.round(v/1000)}k`} />
                     <Tooltip cursor={{ stroke: 'rgba(255,255,255,0.1)' }} contentStyle={{ background: 'rgba(10,12,25,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10 }} />
                     <Legend wrapperStyle={{ fontSize: 12, color: 'rgba(255,255,255,0.5)' }} />
+                    <ReferenceLine x={currentMonthName} stroke="rgba(255,255,255,0.35)" strokeDasharray="4 2"
+                      label={{ value: 'Today', position: 'insideTopRight', fill: 'rgba(255,255,255,0.45)', fontSize: 10 }} />
                     <Line type="monotone" dataKey="actual" stroke="#22d3a8" strokeWidth={3} dot={{ r: 4 }} name="Actual Sales" connectNulls={false} />
                     <Line type="monotone" dataKey="xgboost" stroke="#6C63FF" strokeWidth={2.5} strokeDasharray="6 3" dot={{ r: 3 }} name="XGBoost Base Forecast" connectNulls />
                     <Line type="monotone" dataKey="adjusted" stroke="#00D4FF" strokeWidth={2.5} strokeDasharray="3 3" dot={{ r: 3 }} name="PPO + LLM Adjusted" connectNulls />
@@ -809,7 +824,7 @@ export default function SalesForecast() {
                           label={{ value: 'Neutral', position: 'insideTopRight', fill: 'rgba(255,255,255,0.3)', fontSize: 9 }} />
                         <Scatter data={sentimentReorderData} name="Pipeline Runs">
                           {sentimentReorderData.map((entry: any, i: number) => (
-                            <Cell key={i} fill={entry.fill} fillOpacity={0.8} />
+                            <Cell key={i} fill={entry.fill} fillOpacity={entry.hasData ? 0.82 : 0.35} />
                           ))}
                         </Scatter>
                       </ScatterChart>
