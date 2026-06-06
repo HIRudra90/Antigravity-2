@@ -8,8 +8,8 @@ import {
 } from 'recharts'
 import {
   TrendingUp, Target, Zap, AlertCircle, BarChart2,
-  Layers, Activity, Sparkles, RefreshCw,
-  CheckCircle, Eye
+  Layers, Activity, Sparkles, RefreshCw, Trash2,
+  CheckCircle, Eye, X
 } from 'lucide-react'
 
 
@@ -38,6 +38,9 @@ export default function SalesForecast() {
   const [pipelineResult, setPipelineResult] = useState<any>(null)
   const [predictionHistory, setPredictionHistory] = useState<any[]>([])
   const [loadingHistory, setLoadingHistory] = useState<boolean>(false)
+  const [inspectedRow, setInspectedRow] = useState<any>(null)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [deletingAll, setDeletingAll] = useState<boolean>(false)
   
   // Notification states
   const [successToast, setSuccessToast] = useState<string>('')
@@ -370,6 +373,45 @@ export default function SalesForecast() {
   }
 
   // Render a specific historical entry from log table
+  async function handleDeleteRow(id: string) {
+    setDeletingId(id)
+    try {
+      const { error } = await supabase.from('demand_forecasts').delete().eq('id', id)
+      if (!error) {
+        setPredictionHistory(prev => prev.filter((r: any) => r.id !== id))
+        if (inspectedRow?.id === id) setInspectedRow(null)
+        fetchDashboardIntelligence()
+        setSuccessToast('Entry deleted.')
+      } else {
+        setErrorToast(`Delete failed: ${error.message}`)
+      }
+    } catch {
+      setErrorToast('Delete failed.')
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  async function handleDeleteAll() {
+    if (!window.confirm('Delete ALL prediction history? This cannot be undone.')) return
+    setDeletingAll(true)
+    try {
+      const { error } = await supabase.from('demand_forecasts').delete().not('id', 'is', null)
+      if (!error) {
+        setPredictionHistory([])
+        setInspectedRow(null)
+        fetchDashboardIntelligence()
+        setSuccessToast('All prediction history cleared.')
+      } else {
+        setErrorToast(`Clear failed: ${error.message}`)
+      }
+    } catch {
+      setErrorToast('Clear all failed.')
+    } finally {
+      setDeletingAll(false)
+    }
+  }
+
   function handleLoadHistoryRow(entry: any) {
     setSelectedProductId(entry.product_id)
     setSelectedProduct(products.find(p => p.id === entry.product_id) || { name: entry.product_name })
@@ -1245,79 +1287,194 @@ export default function SalesForecast() {
           {/* SYSTEM-WIDE LOGS HISTORY TABLE */}
           <div className="glass-card" style={{ marginTop: 8 }}>
             <div className="section-title">
-              <span>Prediction Log & Run History (Supabase Connected)</span>
-              <button 
-                className="btn btn-ghost btn-sm" 
-                onClick={fetchPredictionHistory}
-                disabled={loadingHistory}
-                style={{ padding: '4px 10px', fontSize: 11 }}
-              >
-                <RefreshCw size={12} className={loadingHistory ? "shimmer-spin" : ""} style={{ animation: loadingHistory ? "spin 1s linear infinite" : "none" }} /> Refresh History
-              </button>
+              <span>Prediction Log & Run History</span>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => { fetchPredictionHistory(); fetchDashboardIntelligence() }}
+                  disabled={loadingHistory}
+                  style={{ padding: '4px 10px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 5 }}
+                >
+                  <RefreshCw size={12} style={{ animation: loadingHistory ? 'spin 0.8s linear infinite' : 'none' }} />
+                  Refresh
+                </button>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={handleDeleteAll}
+                  disabled={deletingAll || predictionHistory.length === 0}
+                  style={{ padding: '4px 10px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 5, color: '#f43f5e', borderColor: 'rgba(244,63,94,0.3)' }}
+                >
+                  <Trash2 size={12} />
+                  {deletingAll ? 'Clearing…' : 'Clear All'}
+                </button>
+              </div>
             </div>
-            
+
             <div style={{ overflowX: 'auto' }}>
               <table className="data-table">
                 <thead>
                   <tr>
                     <th>Product</th>
                     <th>Horizon</th>
-                    <th>Stock Rates</th>
-                    <th>Sentiment Multiplier</th>
-                    <th>PPO RL Restock Qty</th>
-                    <th>Prediction Time</th>
+                    <th>Stock</th>
+                    <th>Sentiment</th>
+                    <th>PPO Restock</th>
+                    <th>Time</th>
                     <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {predictionHistory.map((row) => (
-                    <tr key={row.id}>
-                      <td>
-                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                    <>
+                      <tr key={row.id} style={{ background: inspectedRow?.id === row.id ? 'rgba(108,99,255,0.06)' : undefined }}>
+                        <td>
                           <span style={{ fontWeight: 600, color: '#fff' }}>{row.product_name}</span>
-                          <span style={{ fontSize: 10, color: 'var(--clr-text-muted)' }}>ID: {row.product_id}</span>
-                        </div>
-                      </td>
-                      <td>
-                        <span className="badge badge-accent">{row.forecast_period}</span>
-                      </td>
-                      <td>
-                        <div style={{ display: 'flex', gap: 12, fontSize: 12.5 }}>
-                          <span>Stock: <strong style={{ color: '#fff' }}>{row.current_stock}</strong></span>
-                          <span>Reorder: <strong style={{ color: 'var(--clr-warning)' }}>{row.reorder_level}</strong></span>
-                        </div>
-                      </td>
-                      <td>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <strong style={{ color: row.sentiment_multiplier > 1.0 ? 'var(--clr-success)' : row.sentiment_multiplier < 1.0 ? 'var(--clr-danger)' : '#fff' }}>
-                            x{parseFloat(row.sentiment_multiplier).toFixed(2)}
+                        </td>
+                        <td><span className="badge badge-accent">{row.forecast_period}</span></td>
+                        <td>
+                          <div style={{ fontSize: 12 }}>
+                            <span style={{ color: '#fff' }}>{row.current_stock}</span>
+                            <span style={{ color: 'var(--clr-text-muted)' }}> / {row.reorder_level} reorder</span>
+                          </div>
+                        </td>
+                        <td>
+                          <strong style={{ color: row.sentiment_multiplier > 1.02 ? 'var(--clr-success)' : row.sentiment_multiplier < 0.98 ? 'var(--clr-danger)' : '#fff' }}>
+                            x{parseFloat(row.sentiment_multiplier).toFixed(3)}
+                            {row.sentiment_multiplier > 1.02 ? ' ↑' : row.sentiment_multiplier < 0.98 ? ' ↓' : ' ─'}
                           </strong>
-                        </div>
-                      </td>
-                      <td>
-                        <strong style={{ color: row.optimal_reorder_qty > 0 ? 'var(--clr-success)' : 'var(--clr-text-muted)' }}>
-                          {row.optimal_reorder_qty > 0 ? `+${row.optimal_reorder_qty} units` : '0 (Hold)'}
-                        </strong>
-                      </td>
-                      <td style={{ color: 'var(--clr-text-muted)', fontSize: 12 }}>
-                        {new Date(row.predicted_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
-                      </td>
-                      <td>
-                        <button 
-                          className="btn btn-ghost btn-sm" 
-                          style={{ padding: '4px 8px', borderRadius: 'var(--r-sm)', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}
-                          onClick={() => handleLoadHistoryRow(row)}
-                        >
-                          <Eye size={12} /> Inspect
-                        </button>
-                      </td>
-                    </tr>
+                        </td>
+                        <td>
+                          <strong style={{ color: row.optimal_reorder_qty > 0 ? 'var(--clr-success)' : 'var(--clr-text-muted)' }}>
+                            {row.optimal_reorder_qty > 0 ? `+${row.optimal_reorder_qty}` : 'Hold'}
+                          </strong>
+                        </td>
+                        <td style={{ color: 'var(--clr-text-muted)', fontSize: 11 }}>
+                          {new Date(row.predicted_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+                        </td>
+                        <td>
+                          <div style={{ display: 'flex', gap: 6 }}>
+                            <button
+                              className="btn btn-ghost btn-sm"
+                              style={{ padding: '4px 8px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, color: inspectedRow?.id === row.id ? 'var(--clr-accent-2)' : undefined }}
+                              onClick={() => setInspectedRow(inspectedRow?.id === row.id ? null : row)}
+                            >
+                              <Eye size={12} /> {inspectedRow?.id === row.id ? 'Close' : 'Inspect'}
+                            </button>
+                            <button
+                              className="btn btn-ghost btn-sm"
+                              style={{ padding: '4px 8px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, color: '#f43f5e', opacity: deletingId === row.id ? 0.5 : 1 }}
+                              onClick={() => handleDeleteRow(row.id)}
+                              disabled={deletingId === row.id}
+                            >
+                              <Trash2 size={11} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+
+                      {/* Inline inspection panel */}
+                      {inspectedRow?.id === row.id && (
+                        <tr key={`${row.id}-inspect`}>
+                          <td colSpan={7} style={{ padding: 0 }}>
+                            <div style={{ padding: '16px 20px', background: 'rgba(108,99,255,0.04)', borderTop: '1px solid rgba(108,99,255,0.15)', borderBottom: '1px solid rgba(108,99,255,0.15)', display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+                              {/* Header */}
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <div style={{ fontWeight: 700, color: '#fff', fontSize: 13 }}>
+                                  {row.product_name} — {row.forecast_period} forecast
+                                  <span style={{ marginLeft: 10, fontSize: 11, color: 'var(--clr-text-muted)', fontWeight: 400 }}>
+                                    {new Date(row.predicted_at).toLocaleString()}
+                                  </span>
+                                </div>
+                                <button onClick={() => setInspectedRow(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.3)' }}>
+                                  <X size={14} />
+                                </button>
+                              </div>
+
+                              {/* 3 metric cards */}
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+                                <div style={{ padding: 12, borderRadius: 8, background: 'rgba(0,212,255,0.06)', border: '1px solid rgba(0,212,255,0.2)' }}>
+                                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', marginBottom: 4, fontWeight: 700, textTransform: 'uppercase' }}>LLM Market Sentiment</div>
+                                  <div style={{ fontSize: 24, fontWeight: 800, color: row.sentiment_multiplier > 1.02 ? '#22d3a8' : row.sentiment_multiplier < 0.98 ? '#f43f5e' : '#fff' }}>
+                                    x{parseFloat(row.sentiment_multiplier).toFixed(3)}
+                                  </div>
+                                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginTop: 2 }}>
+                                    {row.sentiment_multiplier > 1.02 ? '↑ Demand increasing' : row.sentiment_multiplier < 0.98 ? '↓ Demand decreasing' : '─ Neutral baseline'}
+                                  </div>
+                                </div>
+                                <div style={{ padding: 12, borderRadius: 8, background: 'rgba(108,99,255,0.06)', border: '1px solid rgba(108,99,255,0.2)' }}>
+                                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', marginBottom: 4, fontWeight: 700, textTransform: 'uppercase' }}>XGBoost Demand ({row.forecast_period})</div>
+                                  <div style={{ fontSize: 24, fontWeight: 800, color: '#a78bfa' }}>
+                                    {Array.isArray(row.forecasted_demand)
+                                      ? Math.round(row.forecasted_demand.reduce((a: number, b: number) => a + b, 0))
+                                      : '—'} units
+                                  </div>
+                                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginTop: 2 }}>
+                                    {Array.isArray(row.forecasted_demand)
+                                      ? `~${(row.forecasted_demand.reduce((a: number, b: number) => a + b, 0) / (row.forecast_period === '7d' ? 7 : row.forecast_period === '90d' ? 90 : row.forecast_period === '365d' ? 365 : 30)).toFixed(1)} units/day avg`
+                                      : ''}
+                                  </div>
+                                </div>
+                                <div style={{ padding: 12, borderRadius: 8, background: 'rgba(34,211,168,0.06)', border: '1px solid rgba(34,211,168,0.2)' }}>
+                                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', marginBottom: 4, fontWeight: 700, textTransform: 'uppercase' }}>PPO RL Decision</div>
+                                  <div style={{ fontSize: 24, fontWeight: 800, color: row.optimal_reorder_qty > 0 ? '#22d3a8' : 'rgba(255,255,255,0.4)' }}>
+                                    {row.optimal_reorder_qty > 0 ? `+${row.optimal_reorder_qty}` : 'Hold'}
+                                  </div>
+                                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginTop: 2 }}>
+                                    {row.optimal_reorder_qty > 0 ? 'Restock recommended' : 'Inventory sufficient'}
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Sentiment analysis */}
+                              {row.sentiment_analysis && (
+                                <div>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: 'rgba(255,255,255,0.35)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>Analyst Conclusion</div>
+                                  <p style={{ fontSize: 12.5, lineHeight: 1.65, color: 'rgba(240,242,255,0.65)', margin: 0 }}>{row.sentiment_analysis}</p>
+                                </div>
+                              )}
+
+                              {/* First 10 days forecast */}
+                              {Array.isArray(row.forecasted_demand) && row.forecasted_demand.length > 0 && (
+                                <div>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: 'rgba(255,255,255,0.35)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>
+                                    First 10 Days — Daily Demand Forecast
+                                  </div>
+                                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                                    {row.forecasted_demand.slice(0, 10).map((val: number, i: number) => (
+                                      <div key={i} style={{ padding: '4px 10px', background: 'rgba(108,99,255,0.12)', borderRadius: 6, fontSize: 11, color: '#a78bfa', fontWeight: 600 }}>
+                                        Day {i + 1}: {Math.round(val)}
+                                      </div>
+                                    ))}
+                                    {row.forecasted_demand.length > 10 && (
+                                      <div style={{ padding: '4px 10px', background: 'rgba(255,255,255,0.04)', borderRadius: 6, fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>
+                                        +{row.forecasted_demand.length - 10} more days…
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Market context */}
+                              {row.market_text && (
+                                <div>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: 'rgba(255,255,255,0.35)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>Market Context Used</div>
+                                  <p style={{ fontSize: 11, lineHeight: 1.6, color: 'rgba(255,255,255,0.4)', margin: 0, maxHeight: 72, overflow: 'hidden' }}>
+                                    {row.market_text.slice(0, 320)}{row.market_text.length > 320 ? '…' : ''}
+                                  </p>
+                                </div>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </>
                   ))}
-                  
+
                   {predictionHistory.length === 0 && !loadingHistory && (
                     <tr>
                       <td colSpan={7} style={{ textAlign: 'center', padding: '30px 10px', color: 'var(--clr-text-muted)', fontSize: 13 }}>
-                        No forecasting execution logs found. Run a prediction above to log into Supabase!
+                        No prediction logs yet. Run the pipeline to start logging.
                       </td>
                     </tr>
                   )}
