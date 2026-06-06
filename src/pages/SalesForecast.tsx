@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabaseClient'
-import { forecastSales } from '../lib/mlEngine'
 import {
   AreaChart, Area, LineChart, Line,
   ScatterChart, Scatter,
@@ -46,7 +45,6 @@ export default function SalesForecast() {
 
   // Dashboard intelligence state (real data from demand_forecasts)
   const [productForecasts, setProductForecasts] = useState<any[]>([])
-  const [historyForecasts, setHistoryForecasts] = useState<any[]>([])
   const [stockActions, setStockActions] = useState<any[]>([])
   const [dashLoading, setDashLoading] = useState<boolean>(true)
   const [dashStats, setDashStats] = useState({
@@ -141,7 +139,7 @@ export default function SalesForecast() {
     }
   }
 
-  // Fetch actual monthly sales for the Actual vs Forecast line chart
+  // Fetch actual monthly sales — no JS trend projection, real XGBoost forecast added in render
   async function fetchSalesData() {
     try {
       const { data: sales, error: salesError } = await supabase
@@ -152,29 +150,19 @@ export default function SalesForecast() {
       if (salesError) throw salesError
 
       if (sales) {
-        const monthlyStats: any = {}
-        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        const monthlyStats: Record<string, number> = {}
+        const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 
         sales.forEach((s: any) => {
-          const d = new Date(s.sale_date)
-          const monthName = months[d.getMonth()]
+          const monthName = months[new Date(s.sale_date).getMonth()]
           const product = Array.isArray(s.products) ? s.products[0] : s.products
           monthlyStats[monthName] = (monthlyStats[monthName] || 0) + (s.quantity_sold * (product?.unit_price || 0))
         })
 
-        const activeMonths = months.filter(m => monthlyStats[m] > 0)
-        const predictions = forecastSales(activeMonths.map(m => monthlyStats[m]), 3)
-        const nextMonths = months.slice(
-          months.indexOf(activeMonths[activeMonths.length - 1]) + 1,
-          months.indexOf(activeMonths[activeMonths.length - 1]) + 4
-        )
-
-        const chartData = months.map(m => {
-          const actual = monthlyStats[m] || null
-          const predIdx = nextMonths.indexOf(m)
-          const predictedValue = predIdx !== -1 ? predictions[predIdx] : (actual ? actual * 1.02 : null)
-          return { month: m, actual, predicted: Math.round(predictedValue || 0) }
-        }).filter(d => d.actual || nextMonths.includes(d.month))
+        // Only store months with actual data — forecast line added from real XGBoost runs
+        const chartData = months
+          .filter(m => monthlyStats[m] > 0)
+          .map(m => ({ month: m, actual: Math.round(monthlyStats[m]), predicted: null as number | null }))
 
         setPredictionData(chartData)
       }
@@ -243,7 +231,6 @@ export default function SalesForecast() {
       })
 
       setProductForecasts(enriched)
-      setHistoryForecasts(allForecasts)
 
       // Top-level stats
       const totalRevenue = enriched.reduce((s: number, f: any) => s + f.forecasted_revenue, 0)
@@ -436,6 +423,8 @@ export default function SalesForecast() {
   }
 
   // ── Chart data derivations ──────────────────────────────────────
+
+  // Bubble chart — one bubble per product (latest run)
   const bubbleChartData = productForecasts.map((f: any) => ({
     x: f.current_stock_live,
     y: f.total_forecasted_demand,
@@ -445,12 +434,30 @@ export default function SalesForecast() {
     fill: f.urgency === 'CRITICAL' ? '#f43f5e' : f.urgency === 'HIGH' ? '#f59e0b' : f.urgency === 'MEDIUM' ? '#00D4FF' : '#22d3a8',
   }))
 
-  const sentimentReorderData = historyForecasts.map((f: any) => ({
+  // Sentiment vs Reorder — one dot per product (latest run, no duplicates)
+  const sentimentReorderData = productForecasts.map((f: any) => ({
     sentiment: parseFloat(f.sentiment_multiplier) || 1.0,
     reorder: f.optimal_reorder_qty || 0,
     name: f.product_name,
     fill: parseFloat(f.sentiment_multiplier) > 1.02 ? '#22d3a8' : parseFloat(f.sentiment_multiplier) < 0.98 ? '#f43f5e' : '#6C63FF',
   }))
+
+  // Actual vs Forecast line chart — actual from Supabase + XGBoost forecast from real pipeline runs
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+  const totalDailyXgboostRevenue = productForecasts.reduce(
+    (sum: number, f: any) => sum + ((f.daily_demand || 0) * (f.unit_price || 0)), 0
+  )
+  const combinedChartData = [
+    ...predictionData,
+    ...(productForecasts.length > 0 && totalDailyXgboostRevenue > 0
+      ? [1, 2, 3].map(offset => ({
+          month: MONTHS[(new Date().getMonth() + offset) % 12],
+          actual: null as number | null,
+          predicted: Math.round(totalDailyXgboostRevenue * 30),
+        }))
+      : []
+    ),
+  ]
 
   return (
     <div className="page-enter">
@@ -543,7 +550,7 @@ export default function SalesForecast() {
               </div>
               <div className="chart-wrapper-lg">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={predictionData}>
+                  <LineChart data={combinedChartData}>
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                     <XAxis dataKey="month" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={v => `$${Math.round(v/1000)}k`} />
