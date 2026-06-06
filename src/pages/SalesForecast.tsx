@@ -45,6 +45,7 @@ export default function SalesForecast() {
 
   // Dashboard intelligence state (real data from demand_forecasts)
   const [productForecasts, setProductForecasts] = useState<any[]>([])
+  const [historyForecasts, setHistoryForecasts] = useState<any[]>([])
   const [stockActions, setStockActions] = useState<any[]>([])
   const [dashLoading, setDashLoading] = useState<boolean>(true)
   const [dashStats, setDashStats] = useState({
@@ -231,6 +232,7 @@ export default function SalesForecast() {
       })
 
       setProductForecasts(enriched)
+      setHistoryForecasts(allForecasts)
 
       // Top-level stats
       const totalRevenue = enriched.reduce((s: number, f: any) => s + f.forecasted_revenue, 0)
@@ -434,26 +436,48 @@ export default function SalesForecast() {
     fill: f.urgency === 'CRITICAL' ? '#f43f5e' : f.urgency === 'HIGH' ? '#f59e0b' : f.urgency === 'MEDIUM' ? '#00D4FF' : '#22d3a8',
   }))
 
-  // Sentiment vs Reorder — one dot per product (latest run, no duplicates)
-  const sentimentReorderData = productForecasts.map((f: any) => ({
-    sentiment: parseFloat(f.sentiment_multiplier) || 1.0,
-    reorder: f.optimal_reorder_qty || 0,
-    name: f.product_name,
-    fill: parseFloat(f.sentiment_multiplier) > 1.02 ? '#22d3a8' : parseFloat(f.sentiment_multiplier) < 0.98 ? '#f43f5e' : '#6C63FF',
-  }))
+  // Sentiment vs Reorder — ALL pipeline runs, one dot per run, colored by product
+  const SCATTER_COLORS = ['#22d3a8','#6C63FF','#f59e0b','#f43f5e','#00D4FF','#a78bfa','#FF6B9D','#34d399','#fb923c','#38bdf8']
+  const sentimentReorderData = (() => {
+    const colorMap: Record<string, string> = {}
+    let idx = 0
+    return historyForecasts.map((f: any) => {
+      const name = f.product_name || 'Unknown'
+      if (!colorMap[name]) colorMap[name] = SCATTER_COLORS[idx++ % SCATTER_COLORS.length]
+      return {
+        sentiment: parseFloat(f.sentiment_multiplier) || 1.0,
+        reorder: f.optimal_reorder_qty || 0,
+        name,
+        fill: colorMap[name],
+      }
+    })
+  })()
 
-  // Actual vs Forecast line chart — actual from Supabase + XGBoost forecast from real pipeline runs
+  // Unique products for scatter legend
+  const scatterLegend = Object.entries(
+    sentimentReorderData.reduce((acc: Record<string, string>, d: any) => {
+      if (!acc[d.name]) acc[d.name] = d.fill
+      return acc
+    }, {})
+  )
+
+  // Line chart — actual sales + XGBoost base + PPO/LLM adjusted (3 lines)
   const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-  const totalDailyXgboostRevenue = productForecasts.reduce(
-    (sum: number, f: any) => sum + ((f.daily_demand || 0) * (f.unit_price || 0)), 0
+  const xgboostBaseMonthly = productForecasts.reduce((sum: number, f: any) => {
+    const base = (f.daily_demand || 0) / (parseFloat(f.sentiment_multiplier) || 1.0)
+    return sum + base * (f.unit_price || 0) * 30
+  }, 0)
+  const sentimentAdjustedMonthly = productForecasts.reduce(
+    (sum: number, f: any) => sum + (f.daily_demand || 0) * (f.unit_price || 0) * 30, 0
   )
   const combinedChartData = [
-    ...predictionData,
-    ...(productForecasts.length > 0 && totalDailyXgboostRevenue > 0
+    ...predictionData.map((d: any) => ({ ...d, xgboost: null as number | null, adjusted: null as number | null })),
+    ...(productForecasts.length > 0 && sentimentAdjustedMonthly > 0
       ? [1, 2, 3].map(offset => ({
           month: MONTHS[(new Date().getMonth() + offset) % 12],
           actual: null as number | null,
-          predicted: Math.round(totalDailyXgboostRevenue * 30),
+          xgboost: xgboostBaseMonthly > 0 ? Math.round(xgboostBaseMonthly) : null as number | null,
+          adjusted: Math.round(sentimentAdjustedMonthly),
         }))
       : []
     ),
@@ -556,8 +580,9 @@ export default function SalesForecast() {
                     <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={v => `$${Math.round(v/1000)}k`} />
                     <Tooltip cursor={{ stroke: 'rgba(255,255,255,0.1)' }} contentStyle={{ background: 'rgba(10,12,25,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10 }} />
                     <Legend wrapperStyle={{ fontSize: 12, color: 'rgba(255,255,255,0.5)' }} />
-                    <Line type="monotone" dataKey="actual" stroke="#22d3a8" strokeWidth={3} dot={{ r: 4 }} name="Actual Sales" />
-                    <Line type="monotone" dataKey="predicted" stroke="#6C63FF" strokeWidth={3} strokeDasharray="5 5" dot={{ r: 4 }} name="XGBoost Forecast" />
+                    <Line type="monotone" dataKey="actual" stroke="#22d3a8" strokeWidth={3} dot={{ r: 4 }} name="Actual Sales" connectNulls={false} />
+                    <Line type="monotone" dataKey="xgboost" stroke="#6C63FF" strokeWidth={2.5} strokeDasharray="6 3" dot={{ r: 3 }} name="XGBoost Base Forecast" connectNulls />
+                    <Line type="monotone" dataKey="adjusted" stroke="#00D4FF" strokeWidth={2.5} strokeDasharray="3 3" dot={{ r: 3 }} name="PPO + LLM Adjusted" connectNulls />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -754,7 +779,7 @@ export default function SalesForecast() {
                 <div className="glass-card">
                   <div className="section-title">
                     Sentiment vs Reorder Decision
-                    <span className="badge badge-accent" style={{ fontSize: 10 }}>LLM Signal → PPO Action</span>
+                    <span className="badge badge-accent" style={{ fontSize: 10 }}>All runs · colour = product</span>
                   </div>
                   <div style={{ height: 260 }}>
                     <ResponsiveContainer width="100%" height="100%">
@@ -790,10 +815,11 @@ export default function SalesForecast() {
                       </ScatterChart>
                     </ResponsiveContainer>
                   </div>
-                  <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 6 }}>
-                    {[['#22d3a8','Positive (>x1.02)'],['#f43f5e','Negative (<x0.98)'],['#6C63FF','Neutral']].map(([c,l]) => (
-                      <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: 'rgba(255,255,255,0.5)' }}>
-                        <div style={{ width: 8, height: 8, borderRadius: '50%', background: c }} />{l}
+                  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 6 }}>
+                    {scatterLegend.map(([name, color]) => (
+                      <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: 'rgba(255,255,255,0.55)' }}>
+                        <div style={{ width: 8, height: 8, borderRadius: '50%', background: String(color), flexShrink: 0 }} />
+                        {String(name).length > 16 ? String(name).slice(0, 14) + '…' : name}
                       </div>
                     ))}
                   </div>
