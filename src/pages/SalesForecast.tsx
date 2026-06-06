@@ -373,18 +373,25 @@ export default function SalesForecast() {
   }
 
   // Render a specific historical entry from log table
+  const RLS_SQL_FIX = `ALTER TABLE public.demand_forecasts DISABLE ROW LEVEL SECURITY;`
+
   async function handleDeleteRow(id: string) {
     setDeletingId(id)
     try {
       const { error } = await supabase.from('demand_forecasts').delete().eq('id', id)
-      if (!error) {
-        setPredictionHistory(prev => prev.filter((r: any) => r.id !== id))
-        if (inspectedRow?.id === id) setInspectedRow(null)
-        fetchDashboardIntelligence()
-        setSuccessToast('Entry deleted.')
-      } else {
-        setErrorToast(`Delete failed: ${error.message}`)
+      if (error) { setErrorToast(`Delete failed: ${error.message}`); return }
+
+      // Verify the row is actually gone
+      const { data: check } = await supabase.from('demand_forecasts').select('id').eq('id', id)
+      if (check && check.length > 0) {
+        setErrorToast('Supabase blocked the delete (RLS). Run the SQL shown below the table.')
+        return
       }
+
+      setPredictionHistory(prev => prev.filter((r: any) => r.id !== id))
+      if (inspectedRow?.id === id) setInspectedRow(null)
+      fetchDashboardIntelligence()
+      setSuccessToast('Entry deleted.')
     } catch {
       setErrorToast('Delete failed.')
     } finally {
@@ -399,14 +406,22 @@ export default function SalesForecast() {
     setDeletingAll(true)
     try {
       const { error } = await supabase.from('demand_forecasts').delete().in('id', ids)
-      if (!error) {
-        setPredictionHistory([])
-        setInspectedRow(null)
-        fetchDashboardIntelligence()
-        setSuccessToast(`Cleared ${ids.length} prediction log${ids.length !== 1 ? 's' : ''}.`)
-      } else {
-        setErrorToast(`Clear failed: ${error.message}`)
+      if (error) { setErrorToast(`Clear failed: ${error.message}`); setDeletingAll(false); return }
+
+      // Verify records are actually gone
+      const { data: remaining } = await supabase
+        .from('demand_forecasts').select('id').in('id', ids)
+
+      if (remaining && remaining.length > 0) {
+        setErrorToast('Supabase RLS blocked the delete. Run the SQL shown below the table.')
+        setDeletingAll(false)
+        return
       }
+
+      setPredictionHistory([])
+      setInspectedRow(null)
+      fetchDashboardIntelligence()
+      setSuccessToast(`Cleared ${ids.length} prediction log${ids.length !== 1 ? 's' : ''}.`)
     } catch {
       setErrorToast('Clear all failed.')
     } finally {
@@ -1482,6 +1497,17 @@ export default function SalesForecast() {
                   )}
                 </tbody>
               </table>
+            </div>
+
+            {/* Supabase delete permission note */}
+            <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.2)', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>
+                If delete buttons don't work, run this once in your{' '}
+                <strong style={{ color: 'rgba(255,255,255,0.65)' }}>Supabase SQL Editor</strong>:
+              </span>
+              <code style={{ fontSize: 11, background: 'rgba(0,0,0,0.3)', padding: '3px 10px', borderRadius: 5, color: '#f59e0b', userSelect: 'all' }}>
+                {RLS_SQL_FIX}
+              </code>
             </div>
           </div>
         </div>
