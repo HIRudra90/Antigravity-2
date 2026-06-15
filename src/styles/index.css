@@ -196,7 +196,7 @@ body {
   padding: 11px 14px;
   border-radius: var(--r-md);
   cursor: pointer;
-  transition: all var(--t-base);
+  transition: all var(--t-base), box-shadow 0.25s ease;
   border: 1px solid transparent;
   position: relative;
   overflow: hidden;
@@ -216,16 +216,24 @@ body {
 }
 .nav-item:hover {
   color: var(--clr-text);
-  border-color: var(--clr-border-hover);
+  border-color: rgba(180, 220, 255, 0.55);
   background: rgba(255,255,255,0.05);
+  box-shadow:
+    0 0 0 1px rgba(180, 220, 255, 0.2),
+    0 0 12px rgba(180, 220, 255, 0.45),
+    0 0 28px rgba(150, 200, 255, 0.2);
 }
 .nav-item:hover::before { opacity: 1; }
 
 .nav-item.active {
   color: #fff;
   background: rgba(108,99,255,0.18);
-  border-color: rgba(108,99,255,0.35);
-  box-shadow: 0 0 20px rgba(108,99,255,0.2), inset 0 0 20px rgba(108,99,255,0.05);
+  border-color: rgba(180, 220, 255, 0.5);
+  box-shadow:
+    0 0 0 1px rgba(180, 220, 255, 0.25),
+    0 0 14px rgba(180, 220, 255, 0.45),
+    0 0 30px rgba(150, 200, 255, 0.2),
+    inset 0 0 20px rgba(108,99,255,0.05);
 }
 .nav-item.active::before { opacity: 1; }
 
@@ -313,16 +321,20 @@ body {
    ============================================================ */
 .glass-card {
   background: var(--glass-bg);
-  /* No backdrop-filter — use solid bg instead for perf */
   border: 1px solid var(--glass-border);
   border-radius: var(--r-lg);
   padding: 22px;
   box-shadow: var(--shadow-card);
-  /* Only transition transform (GPU only, no repaint) */
-  transition: transform var(--t-base), border-color var(--t-base);
+  transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
 }
 .glass-card:hover {
-  border-color: var(--clr-border-hover);
+  border-color: rgba(0, 212, 255, 0.7);
+  box-shadow:
+    0 0 0 1px rgba(0, 212, 255, 0.3),
+    0 0 20px rgba(0, 212, 255, 0.45),
+    0 0 60px rgba(0, 212, 255, 0.25),
+    0 0 100px rgba(0, 212, 255, 0.12),
+    0 12px 40px rgba(0, 0, 0, 0.6);
 }
 
 /* ============================================================
@@ -340,9 +352,8 @@ body {
   border-radius: var(--r-lg);
   padding: 20px;
   position: relative;
-  overflow: hidden;
-  /* transform only — no box-shadow transition (expensive repaint) */
-  transition: transform var(--t-base), border-color var(--t-base);
+  overflow: visible;
+  transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
 }
 .stat-card::after {
   content: '';
@@ -350,14 +361,20 @@ body {
   top: 0; right: 0;
   width: 80px; height: 80px;
   border-radius: 50%;
-  /* Static glow — no filter animation */
   background: var(--card-glow, rgba(108,99,255,0.12));
   filter: blur(28px);
   pointer-events: none;
+  overflow: hidden;
 }
 .stat-card:hover {
   transform: translateY(-2px);
-  border-color: var(--clr-border-hover);
+  border-color: rgba(0, 212, 255, 0.7);
+  box-shadow:
+    0 0 0 1px rgba(0, 212, 255, 0.3),
+    0 0 20px rgba(0, 212, 255, 0.45),
+    0 0 60px rgba(0, 212, 255, 0.25),
+    0 0 100px rgba(0, 212, 255, 0.12),
+    0 12px 40px rgba(0, 0, 0, 0.6);
 }
 .stat-card-label {
   font-size: 12px;
@@ -427,10 +444,11 @@ body {
 }
 .data-table tr:last-child td { border-bottom: none; }
 .data-table tbody tr {
-  transition: background var(--t-fast);
+  transition: background var(--t-fast), box-shadow 0.25s ease;
 }
 .data-table tbody tr:hover {
-  background: rgba(255,255,255,0.04);
+  background: rgba(0,212,255,0.05);
+  box-shadow: inset 0 0 0 1px rgba(0,212,255,0.18), 0 0 14px rgba(0,212,255,0.12);
 }
 
 /* ============================================================
@@ -465,7 +483,7 @@ body {
   font-weight: 600;
   font-family: var(--font-body);
   cursor: pointer;
-  transition: all var(--t-base);
+  transition: all 0.25s ease, box-shadow 0.25s ease;
   border: 1px solid transparent;
   outline: none;
 }
@@ -476,9 +494,8 @@ body {
   box-shadow: 0 3px 12px rgba(108,99,255,0.3);
 }
 .btn-primary:hover {
-  /* Only transform — no box-shadow change (no repaint) */
   transform: translateY(-1px);
-  opacity: 0.92;
+  box-shadow: 0 0 0 1px rgba(108,99,255,0.5), 0 0 16px rgba(108,99,255,0.55), 0 0 32px rgba(108,99,255,0.3), 0 4px 16px rgba(108,99,255,0.4);
 }
 .btn-ghost {
   background: rgba(255,255,255,0.06);
@@ -487,7 +504,8 @@ body {
 }
 .btn-ghost:hover {
   background: rgba(255,255,255,0.10);
-  border-color: var(--clr-border-hover);
+  border-color: rgba(180,220,255,0.45);
+  box-shadow: 0 0 0 1px rgba(180,220,255,0.15), 0 0 12px rgba(180,220,255,0.25);
 }
 .btn-danger {
   background: rgba(244,63,94,0.15);
@@ -496,6 +514,7 @@ body {
 }
 .btn-danger:hover {
   background: rgba(244,63,94,0.25);
+  box-shadow: 0 0 0 1px rgba(244,63,94,0.4), 0 0 14px rgba(244,63,94,0.4), 0 0 28px rgba(244,63,94,0.2);
 }
 .btn-sm {
   padding: 6px 13px;
@@ -545,13 +564,17 @@ body {
   font-family: var(--font-body);
   font-size: 13.5px;
   outline: none;
-  transition: all var(--t-base);
+  transition: all 0.25s ease, box-shadow 0.25s ease;
 }
 .glass-input::placeholder { color: var(--clr-text-dim); }
+.glass-input:hover {
+  border-color: rgba(180,220,255,0.35);
+  box-shadow: 0 0 10px rgba(180,220,255,0.15);
+}
 .glass-input:focus {
-  border-color: rgba(108,99,255,0.5);
+  border-color: rgba(108,99,255,0.6);
   background: rgba(108,99,255,0.07);
-  box-shadow: 0 0 0 3px rgba(108,99,255,0.12);
+  box-shadow: 0 0 0 1px rgba(108,99,255,0.3), 0 0 16px rgba(108,99,255,0.3), 0 0 32px rgba(108,99,255,0.15);
 }
 
 select.glass-input option {
@@ -652,5 +675,32 @@ select.glass-input option {
 .text-xs { font-size: 11px; }
 .font-semibold { font-weight: 600; }
 .font-bold { font-weight: 700; }
+
+/* ── Modal system ─────────────────────────────────────────── */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(5,8,16,0.55);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.modal-panel {
+  background: rgba(10,12,25,0.97);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 16px;
+  padding: 24px;
+  width: 100%;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.05);
+  animation: modal-in 0.2s cubic-bezier(0.34,1.56,0.64,1);
+}
+@keyframes modal-in {
+  from { opacity: 0; transform: scale(0.93) translateY(12px); }
+  to   { opacity: 1; transform: scale(1)    translateY(0); }
+}
 . r e c h a r t s - t o o l t i p - i t e m   {   c o l o r :   # f f f f f f   ! i m p o r t a n t ;   }   . r e c h a r t s - t o o l t i p - l a b e l   {   c o l o r :   r g b a ( 2 5 5 , 2 5 5 , 2 5 5 , 0 . 7 )   ! i m p o r t a n t ;   }  
  

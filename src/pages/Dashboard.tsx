@@ -57,17 +57,16 @@ export default function Dashboard() {
       if (salesError) throw salesError
 
       if (sales) {
-        // Aggregate Sales Over Time (Last 7 days)
-        const dailySales: any = {}
-        const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-        sales.slice(0, 100).forEach((s: any) => {
-          const d = new Date(s.sale_date)
-          const dayName = days[d.getDay()]
-          const product = Array.isArray(s.products) ? s.products[0] : s.products
-          dailySales[dayName] = (dailySales[dayName] || 0) + (s.quantity_sold * (product?.unit_price || 0))
+        // Use RPC aggregation for the chart — bypasses the 1000-row server cap
+        const { data: dailyRev } = await supabase.rpc('get_daily_revenue', { days_back: 6 })
+        const dateRevMap: Record<string, number> = {}
+        if (dailyRev) (dailyRev as any[]).forEach((r: any) => { dateRevMap[r.sale_date] = Number(r.revenue) })
+        const DAYS_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
+        const chartData = Array.from({length: 7}, (_, i) => {
+          const d = new Date(); d.setDate(d.getDate() - (6 - i))
+          const dateStr = d.toISOString().split('T')[0]
+          return { time: DAYS_SHORT[d.getDay()], sales: Math.round(dateRevMap[dateStr] || 0) }
         })
-        
-        const chartData = days.map(d => ({ time: d, sales: Math.round(dailySales[d] || 0) }))
         setSalesData(chartData)
 
         // Recent Orders transformation
@@ -152,7 +151,7 @@ export default function Dashboard() {
               <XAxis dataKey="time" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} />
               <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v/1000}k`} />
               <Tooltip content={<CustomTooltip />} />
-              <Line type="monotone" dataKey="sales" stroke="#00D4FF" strokeWidth={3} dot={{ fill: '#00D4FF', strokeWidth: 2, r: 4 }} name="Sales" />
+              <Line type="monotone" dataKey="sales" stroke="#00D4FF" strokeWidth={3} dot={{ fill: '#00D4FF', strokeWidth: 2, r: 4 }} activeDot={{ r: 7, stroke: '#fff', strokeWidth: 1.5, filter: 'drop-shadow(0 0 10px #00D4FF)' }} name="Sales" connectNulls />
             </LineChart>
           </ResponsiveContainer>
         </div>

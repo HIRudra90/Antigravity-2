@@ -1,19 +1,17 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Bell, AlertTriangle, AlertCircle, Info, Search, Filter, Calendar, Check, CheckCircle, Trash2, Zap
 } from 'lucide-react'
 import GlassSelect from '../components/GlassSelect'
 import Anthropic from '@anthropic-ai/sdk'
+import { supabase } from '../lib/supabaseClient'
 
-// Dummy intelligent background data
-const dummyAlerts = [
-  { id: '1', type: 'Critical', category: 'Inventory', message: 'Out of stock (Laptop Pro 16")', time: '2 min ago', status: 'New', detail: 'Laptop Pro 16" inventory has reached 0 across all tracked warehouses.', suggestion: 'Restock 150 units immediately to fulfill pending local orders.' },
-  { id: '2', type: 'Warning', category: 'Inventory', message: 'Low stock (Mechanical Keyboards)', time: '1 hour ago', status: 'New', detail: 'Stock level is 34 units (reorder point is 50).', suggestion: 'Trigger restock order within 2 days.' },
-  { id: '3', type: 'Info', category: 'Sales', message: 'Demand spike detected in Apparel', time: 'Just now', status: 'New', detail: 'Apparel category sales increased by 38% in the last 4 hours.', suggestion: 'Increase buffer stock for upcoming weekend peak.' },
-  { id: '4', type: 'Critical', category: 'Payment', message: 'Failed payment from TechStart', time: '3 hours ago', status: 'Reviewing', detail: 'Invoice #TXN-8812 for $3,100 failed due to bank block.', suggestion: 'Send automated email reminder with alternative payment link.' },
-  { id: '5', type: 'Warning', category: 'Logistics', message: 'Delivery delay for SHP-9921', time: 'Yesterday', status: 'Resolved', detail: 'FedEx reports a weather delay in customs clearance.', suggestion: 'Notify customer about updated ETA (Apr 3).' },
-  { id: '6', type: 'Info', category: 'AI', message: 'Price reduction recommended', time: 'Yesterday', status: 'New', detail: 'Standing Desks are experiencing 15% lower movement.', suggestion: 'Reduce price of Standing Desks by 10%.' },
-  { id: '7', type: 'Warning', category: 'AI', message: 'High demand predicted next week', time: '2 days ago', status: 'Read', detail: 'Predictive algorithm AR-4 projects a 25% surge in Electronics.', suggestion: 'Review supplier allocation limits.' },
+const staticAlerts = [
+  { id: 's3', type: 'Info',     category: 'Sales',    message: 'Demand spike detected in Apparel',      time: 'Just now',    status: 'New',       detail: 'Apparel category sales increased by 38% in the last 4 hours.',              suggestion: 'Increase buffer stock for upcoming weekend peak.' },
+  { id: 's4', type: 'Critical', category: 'Payment',  message: 'Failed payment from TechStart',         time: '3 hours ago', status: 'Reviewing', detail: 'Invoice #TXN-8812 for $3,100 failed due to bank block.',                     suggestion: 'Send automated email reminder with alternative payment link.' },
+  { id: 's5', type: 'Warning',  category: 'Logistics',message: 'Delivery delay for SHP-9921',           time: 'Yesterday',   status: 'Resolved',  detail: 'FedEx reports a weather delay in customs clearance.',                       suggestion: 'Notify customer about updated ETA (Apr 3).' },
+  { id: 's6', type: 'Info',     category: 'AI',       message: 'Price reduction recommended',           time: 'Yesterday',   status: 'New',       detail: 'Some items are experiencing lower movement.',                               suggestion: 'Review pricing on slow-moving products.' },
+  { id: 's7', type: 'Warning',  category: 'AI',       message: 'High demand predicted next week',       time: '2 days ago',  status: 'Read',      detail: 'Predictive algorithm projects a 25% surge in Electronics.',                 suggestion: 'Review supplier allocation limits.' },
 ]
 
 const colorMap: Record<string, string> = {
@@ -29,8 +27,42 @@ const iconMap: Record<string, any> = {
 }
 
 export default function Alerts() {
-  const [alerts, setAlerts] = useState(dummyAlerts)
-  const [selectedAlertId, setSelectedAlertId] = useState<string | null>(dummyAlerts[0].id)
+  const [alerts, setAlerts] = useState(staticAlerts)
+  const [selectedAlertId, setSelectedAlertId] = useState<string | null>(staticAlerts[0].id)
+
+  useEffect(() => {
+    async function loadLiveAlerts() {
+      const { data } = await supabase
+        .from('inventory')
+        .select('id, current_stock, reorder_level, products(name, family)')
+        .order('current_stock')
+      if (!data) return
+      const liveAlerts = data
+        .filter((i: any) => i.current_stock <= i.reorder_level)
+        .slice(0, 8)
+        .map((item: any, idx: number) => {
+          const p = Array.isArray(item.products) ? item.products[0] : item.products
+          const isOut = item.current_stock === 0
+          return {
+            id: `inv-${item.id}`,
+            type: isOut ? 'Critical' : 'Warning',
+            category: 'Inventory',
+            message: isOut ? `Out of stock: ${p?.name}` : `Low stock: ${p?.name} (${item.current_stock} left)`,
+            time: idx === 0 ? 'Just now' : idx < 3 ? `${idx * 5} min ago` : `${idx} hours ago`,
+            status: 'New',
+            detail: isOut
+              ? `${p?.name} has 0 units remaining. Reorder level is ${item.reorder_level}.`
+              : `${p?.name} has only ${item.current_stock} units left (reorder level: ${item.reorder_level}). Category: ${p?.family}.`,
+            suggestion: isOut
+              ? `Restock immediately — order at least ${item.reorder_level * 3} units to cover demand.`
+              : `Place a restock order for ${item.reorder_level * 2} units within 1–2 days.`,
+          }
+        })
+      setAlerts([...liveAlerts, ...staticAlerts])
+      if (liveAlerts.length > 0) setSelectedAlertId(liveAlerts[0].id)
+    }
+    loadLiveAlerts()
+  }, [])
   const [filterType, setFilterType] = useState('All')
   const [search, setSearch] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
