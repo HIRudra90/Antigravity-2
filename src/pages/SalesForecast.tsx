@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
+import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
+import { skuFor } from '../lib/restock'
 import {
   AreaChart, Area, LineChart, Line,
   ScatterChart, Scatter,
@@ -13,8 +15,17 @@ import {
   CheckCircle, Eye, X, ChevronDown, ChevronUp
 } from 'lucide-react'
 
+// Reorder policy for the stock recommendations, as a classic (s, S) rule.
+// These two must stay apart: raise an alert below the reorder point, but order
+// up to a strictly higher level. If an order only refills to the trigger, the
+// item drops straight back under it and the alert repeats forever.
+const REORDER_POINT_DAYS = 30   // s — below this many days of cover, act
+const ORDER_UP_TO_DAYS   = 45   // S — order enough to reach this much cover
+
 
 export default function SalesForecast() {
+  const navigate = useNavigate()
+
   // Tab control
   const [activeTab, setActiveTab] = useState<'dashboard' | 'pipeline'>('dashboard')
 
@@ -70,7 +81,29 @@ export default function SalesForecast() {
   })
   const [statusTableOpen, setStatusTableOpen] = useState<boolean>(false)
   const [statCardModal, setStatCardModal] = useState<'revenue' | 'accuracy' | 'sentiment' | 'executions' | 'xgboost' | 'llm' | 'ppo' | null>(null)
+  const [selectedAction, setSelectedAction] = useState<any | null>(null)
+  const [approving, setApproving] = useState(false)
+  const [approveMsg, setApproveMsg] = useState<{ type: 'error' | 'success'; text: string } | null>(null)
+  const [fixingAll, setFixingAll] = useState(false)
+  const [fixAllResult, setFixAllResult] = useState<{ done: number; skipped: number; errors: string[] } | null>(null)
   const [historyOpen, setHistoryOpen] = useState<boolean>(false)
+
+  // Measured model quality — never asserted, always from a holdout backtest.
+  const [modelStatus, setModelStatus] = useState<any | null>(null)
+  const [accuracy, setAccuracy] = useState<{
+    holdoutLabel: string
+    calibrationLabel: string
+    totalAccuracyPct: number      // 100 - |calibrated total - actual total| / actual
+    medianFamilyAccuracyPct: number
+    rawMape: number               // uncalibrated, per family
+    scaleFactor: number           // fitted on the calibration month only
+    actualTotal: number
+    calibratedTotal: number
+    rawPredictedTotal: number
+    perFamily: { family: string; actual: number; calibrated: number; apePct: number }[]
+  } | null>(null)
+  const [accuracyState, setAccuracyState] = useState<'idle' | 'loading' | 'error'>('idle')
+  const [accuracyError, setAccuracyError] = useState('')
 
   // ----------------------------------------------------
   // INITIALIZATION & DATA FETCHING
@@ -80,6 +113,8 @@ export default function SalesForecast() {
     fetchProductsAndInventory()
     fetchPredictionHistory()
     fetchDashboardIntelligence()
+    fetchModelStatus()
+    fetchModelAccuracy()
   }, [])
 
   // Show auto-dismissing toast
@@ -160,21 +195,161 @@ export default function SalesForecast() {
     }
   }
 
+  // Reports which model binaries actually loaded on the backend. Both loaders
+  // fall back to a statistical policy on failure, so without this the UI would
+  // keep claiming XGBoost/PPO for numbers those models never produced.
+  async function fetchModelStatus() {
+    const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/model-status`)
+      if (res.ok) setModelStatus(await res.json())
+    } catch {
+      setModelStatus(null)
+    }
+  }
+
+  /**
+   * Months whose sales data covers every day of the month.
+   *
+   * A partial month looks like a collapse in revenue rather than missing data,
+   * which is exactly what the chart was drawing for June (20 of 30 days) and
+   * what both forecast lines were anchoring to.
+   */
+  async function completeSalesMonths(): Promise<
+    { label: string; first: string; last: string; days: number; revenue: number; units: number }[]
+  > {
+    const { data, error } = await supabase.rpc('get_monthly_sales_coverage', { months_back: 24 })
+    if (error || !data) return []
+    return (data as any[])
+      .filter(r => r.is_complete)
+      .map(r => ({
+        label: r.month_key,
+        first: r.month_start,
+        last: r.month_end,
+        days: Number(r.days_in_month),
+        revenue: Number(r.revenue) || 0,
+        units: Number(r.units) || 0,
+      }))
+  }
+
+  /**
+   * Per-family units actually sold in [from, to].
+   *
+   * Aggregated in Postgres rather than by paging ~8k transaction rows per
+   * month through PostgREST, which took a dozen round trips per month.
+   */
+  async function familyActuals(from: string, to: string): Promise<Map<string, number>> {
+    const out = new Map<string, number>()
+    const { data, error } = await supabase.rpc('get_family_units', { from_date: from, to_date: to })
+    if (error || !data) return out
+    for (const row of data as any[]) out.set(row.family, Number(row.units) || 0)
+    return out
+  }
+
+  /**
+   * Real out-of-sample accuracy.
+   *
+   * The model was trained on a 54-store Ecuadorian dataset, so its raw unit
+   * counts are on a different scale entirely from this catalogue. A single
+   * scale factor is therefore fitted on one complete month and applied,
+   * untouched, to a later month the factor never saw. The holdout month's
+   * sales are never used to derive anything the prediction depends on.
+   */
+  async function fetchModelAccuracy() {
+    setAccuracyState('loading'); setAccuracyError('')
+    const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
+    try {
+      const months = await completeSalesMonths()
+      if (months.length < 2) {
+        setAccuracyError('Needs two complete months of sales history to measure accuracy.')
+        setAccuracyState('error'); return
+      }
+      const calib = months[months.length - 2]
+      const hold = months[months.length - 1]
+
+      const [calibActual, holdActual] = await Promise.all([
+        familyActuals(calib.first, calib.last),
+        familyActuals(hold.first, hold.last),
+      ])
+      const families = Array.from(new Set([...calibActual.keys(), ...holdActual.keys()]))
+      if (families.length === 0) {
+        setAccuracyError('No family-level sales found for the holdout window.')
+        setAccuracyState('error'); return
+      }
+
+      const runBacktest = async (start: string, days: number) => {
+        const res = await fetch(`${BACKEND_URL}/api/predict/backtest`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ start_date: start, days, families }),
+        })
+        if (!res.ok) throw new Error(`Backtest failed (${res.status})`)
+        const json = await res.json()
+        const m = new Map<string, number>()
+        for (const f of json.per_family) m.set(f.family, Number(f.predicted_total) || 0)
+        return m
+      }
+
+      const [calibPred, holdPred] = await Promise.all([
+        runBacktest(calib.first, calib.days),
+        runBacktest(hold.first, hold.days),
+      ])
+
+      const sum = (m: Map<string, number>) => Array.from(m.values()).reduce((a, b) => a + b, 0)
+      const calibPredTotal = sum(calibPred)
+      const scaleFactor = calibPredTotal > 0 ? sum(calibActual) / calibPredTotal : 1
+
+      const perFamily = families
+        .map(family => {
+          const actual = holdActual.get(family) || 0
+          const calibrated = (holdPred.get(family) || 0) * scaleFactor
+          return {
+            family, actual, calibrated,
+            apePct: actual > 0 ? (Math.abs(calibrated - actual) / actual) * 100 : NaN,
+          }
+        })
+        .filter(r => Number.isFinite(r.apePct))
+        .sort((a, b) => a.apePct - b.apePct)
+
+      const actualTotal = sum(holdActual)
+      const rawPredictedTotal = sum(holdPred)
+      const calibratedTotal = rawPredictedTotal * scaleFactor
+      const totalErrPct = actualTotal > 0 ? (Math.abs(calibratedTotal - actualTotal) / actualTotal) * 100 : 100
+      const apes = perFamily.map(r => r.apePct)
+      const medianApe = apes.length ? apes[Math.floor(apes.length / 2)] : 100
+      const rawMape = families.length
+        ? families.reduce((acc, f) => {
+            const a = holdActual.get(f) || 0
+            return a > 0 ? acc + (Math.abs((holdPred.get(f) || 0) - a) / a) * 100 : acc
+          }, 0) / perFamily.length
+        : 0
+
+      setAccuracy({
+        holdoutLabel: hold.label, calibrationLabel: calib.label,
+        totalAccuracyPct: Math.max(0, 100 - totalErrPct),
+        medianFamilyAccuracyPct: Math.max(0, 100 - medianApe),
+        rawMape, scaleFactor, actualTotal, calibratedTotal, rawPredictedTotal, perFamily,
+      })
+      setAccuracyState('idle')
+    } catch (err: any) {
+      setAccuracyError(err?.message || 'Accuracy backtest failed.')
+      setAccuracyState('error')
+    }
+  }
+
   // Fetch actual monthly sales + real AI revenue forecast
   async function fetchSalesData() {
     try {
-      const { data: monthly } = await supabase.rpc('get_monthly_revenue', { months_back: 7 })
-      if (!monthly?.length) return
+      // Only months with data for every day. A month missing days is not a
+      // downturn, and charting one as if it were complete drags the whole
+      // forecast baseline down with it.
+      const months = await completeSalesMonths()
+      if (!months.length) return
+      const last6 = months.slice(-6)
 
-      // Exclude current partial month if less than 25 days have elapsed
-      const daysIntoMonth = new Date().getDate()
-      const allMonths = monthly as any[]
-      const completeMonths = daysIntoMonth < 25 ? allMonths.slice(0, -1) : allMonths
-      const last6 = completeMonths.slice(-6)
-
-      const chartData = last6.map((r: any) => ({
-        month: r.month_key.split(' ')[0],
-        actual: Number(r.revenue),
+      const chartData = last6.map(m => ({
+        month: m.label.split(' ')[0],
+        monthStart: m.first,
+        actual: m.revenue,
       }))
       setPredictionData(chartData)
 
@@ -222,7 +397,15 @@ export default function SalesForecast() {
       const { data: productData } = await supabase
         .from('products').select('id, name, family, unit_price')
       const { data: inventoryData } = await supabase
-        .from('inventory').select('product_id, current_stock, reorder_level')
+        .from('inventory').select('id, product_id, current_stock, reorder_level')
+      // Observed sales velocity per product. The model predicts at product-family
+      // scale (one number for a whole family, on the training set's scale), so
+      // its per-product figure can be many times the real rate. Recorded sales
+      // are the ground truth for how fast a specific product actually moves.
+      const { data: demandData } = await supabase.rpc('get_product_daily_demand', { days_back: 90 })
+      const demandMap = new Map<string, number>(
+        (demandData || []).map((d: any) => [String(d.product_id), Number(d.daily_rate) || 0] as [string, number])
+      )
 
       const productMap = new Map((productData || []).map((p: any) => [String(p.id), p]))
       const invMap = new Map((inventoryData || []).map((i: any) => [String(i.product_id), i]))
@@ -232,7 +415,11 @@ export default function SalesForecast() {
       for (const f of allForecasts) {
         if (!latestByProduct.has(f.product_id)) latestByProduct.set(f.product_id, f)
       }
+      // Only keep forecasts that still map to a product in the catalogue.
+      // Orphaned rows (deleted products, ad-hoc API calls) would otherwise
+      // inflate coverage above 100% and misreport the fleet.
       const latestForecasts = Array.from(latestByProduct.values())
+        .filter((f: any) => productMap.has(String(f.product_id)))
 
       const enriched = latestForecasts.map((f: any) => {
         const prod = productMap.get(String(f.product_id)) || {} as any
@@ -240,25 +427,52 @@ export default function SalesForecast() {
         const periodDays = f.forecast_period === '7d' ? 7 : f.forecast_period === '90d' ? 90 : f.forecast_period === '365d' ? 365 : 30
         const forecastArr: number[] = Array.isArray(f.forecasted_demand) ? f.forecasted_demand : []
         const totalDemand = forecastArr.reduce((a: number, b: number) => a + b, 0)
-        const dailyDemand = periodDays > 0 ? totalDemand / periodDays : 0
+        const modelDaily = periodDays > 0 ? totalDemand / periodDays : 0
+        const observedDaily = demandMap.get(String(f.product_id)) ?? 0
+        // Prefer what the product actually sells. The model only falls back in
+        // when a product has no recorded sales at all, and never sets the order
+        // size on its own, so a family-scale forecast cannot inflate a purchase
+        // order by an order of magnitude.
+        const dailyDemand = observedDaily > 0 ? observedDaily : modelDaily
         const currentStockLive = inv.current_stock ?? f.current_stock ?? 0
         const reorderLevelLive = inv.reorder_level ?? f.reorder_level ?? 0
         const daysOfStock = dailyDemand > 0 ? currentStockLive / dailyDemand : 999
         const unitPrice = prod.unit_price ?? 0
         const urgency = currentStockLive === 0 ? 'CRITICAL'
-          : daysOfStock < 14 ? 'CRITICAL'
-          : daysOfStock < 30 ? 'HIGH'
+          : daysOfStock < REORDER_POINT_DAYS / 2 ? 'CRITICAL'
+          : daysOfStock < REORDER_POINT_DAYS ? 'HIGH'
           : daysOfStock < 60 ? 'MEDIUM' : 'LOW'
+
+        // Quantity that actually clears the alert. The stored PPO figure is
+        // what the model returned against whatever the stock level was at the
+        // time of its pipeline run, and it is never recomputed -- ordering it
+        // left every item still under the reorder point, so the same alert
+        // reappeared on the next refresh. Order up to ORDER_UP_TO_DAYS of
+        // cover instead, so the condition that raised the alert is resolved.
+        const orderUpToQty = dailyDemand > 0
+          ? Math.max(0, Math.ceil(ORDER_UP_TO_DAYS * dailyDemand - currentStockLive))
+          : Math.max(0, (reorderLevelLive || 0) * 2 - currentStockLive)
+        const needsAction = urgency === 'CRITICAL' || urgency === 'HIGH'
+
         return {
           ...f,
           unit_price: unitPrice,
           family: prod.family || '',
+          inventory_id: inv.id,
           total_forecasted_demand: Math.round(totalDemand),
           daily_demand: Math.round(dailyDemand * 10) / 10,
+          model_daily_demand: Math.round(modelDaily * 10) / 10,
+          observed_daily_demand: Math.round(observedDaily * 10) / 10,
+          demand_basis: observedDaily > 0 ? 'recorded sales' : 'model forecast',
           days_of_stock: Math.round(daysOfStock),
           forecasted_revenue: Math.round(totalDemand * unitPrice),
           current_stock_live: currentStockLive,
           reorder_level_live: reorderLevelLive,
+          ppo_reorder_qty: f.optimal_reorder_qty || 0,
+          recommended_qty: needsAction ? orderUpToQty : 0,
+          days_after_restock: dailyDemand > 0
+            ? Math.round((currentStockLive + orderUpToQty) / dailyDemand)
+            : 999,
           urgency,
         }
       })
@@ -275,15 +489,26 @@ export default function SalesForecast() {
         forecastedRevenue: totalRevenue,
         totalForecasts: allForecasts.length,
         avgSentiment: Math.round(avgSent * 1000) / 1000,
-        productsNeedingRestock: enriched.filter((f: any) => (f.optimal_reorder_qty || 0) > 0).length,
+        // Live shortfall, not the stored pipeline figure — otherwise this count
+        // never moves no matter how much stock is added.
+        productsNeedingRestock: enriched.filter((f: any) => f.recommended_qty > 0).length,
       })
 
 
-      // Stock action recommendations
+      // Stock action recommendations.
+      //
+      // Driven purely by live stock against live demand. The previous filter
+      // also admitted anything whose stored optimal_reorder_qty was > 0 --
+      // a value written once by the pipeline and never updated by restocking,
+      // so 58 of 67 products qualified permanently no matter how much stock
+      // they had. Restocking could not clear that, which is why the list
+      // always came back.
       const urgencyOrder: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 }
       const actions = enriched
-        .filter((f: any) => (f.optimal_reorder_qty > 0) || f.urgency === 'CRITICAL' || f.urgency === 'HIGH')
-        .sort((a: any, b: any) => (urgencyOrder[a.urgency] ?? 3) - (urgencyOrder[b.urgency] ?? 3))
+        .filter((f: any) => f.recommended_qty > 0)
+        .sort((a: any, b: any) =>
+          (urgencyOrder[a.urgency] ?? 3) - (urgencyOrder[b.urgency] ?? 3) ||
+          a.days_of_stock - b.days_of_stock)
       setStockActions(actions)
 
     } catch (err) {
@@ -312,19 +537,18 @@ export default function SalesForecast() {
           .order('sale_date', { ascending: false })
           .limit(12)
           
-        if (salesData && salesData.length > 3) {
+        // Only ever show real recorded sales. If this product has no transaction
+        // history yet, leave the field empty rather than inventing numbers —
+        // the pipeline must never be fed fabricated input.
+        if (salesData && salesData.length > 0) {
           const salesArr = salesData.map((s: any) => s.quantity_sold).reverse()
           setHistoricalSalesInput(salesArr.join(', '))
         } else {
-          // Generates beautiful realistic standard inventory historical values
-          const base = Math.floor(Math.random() * 30) + 15
-          const mockHist = Array.from({ length: 12 }, () => 
-            Math.max(2, base + Math.floor(Math.random() * 16) - 8)
-          )
-          setHistoricalSalesInput(mockHist.join(', '))
+          setHistoricalSalesInput('')
         }
       } catch (e) {
         console.error(e)
+        setHistoricalSalesInput('')
       }
     }
   }
@@ -466,24 +690,27 @@ export default function SalesForecast() {
     const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
     let successCount = 0
     let errorCount = 0
+    let skippedCount = 0
 
     for (let i = 0; i < products.length; i++) {
       const prod = products[i]
       setBatchProgress(prev => ({ ...prev, done: i, current: prod.name }))
 
-      // Try real sales history from Supabase, else deterministic placeholder
+      // Real recorded sales only. A product with no transaction history is
+      // skipped — running the pipeline on invented input would produce a
+      // forecast that looks authoritative but describes nothing.
       let salesArr: number[] = []
       try {
         const { data: salesData } = await supabase
           .from('sales_transactions').select('quantity_sold')
           .eq('product_id', prod.id).order('sale_date', { ascending: false }).limit(12)
-        if (salesData && salesData.length > 3)
+        if (salesData && salesData.length > 0)
           salesArr = salesData.map((s: any) => s.quantity_sold).reverse()
       } catch {}
 
       if (salesArr.length === 0) {
-        const base = 15 + (i % 8) * 4
-        salesArr = Array.from({ length: 12 }, (_, j) => Math.max(2, base + (j % 5) - 2))
+        skippedCount++
+        continue
       }
 
       try {
@@ -508,9 +735,11 @@ export default function SalesForecast() {
     setBatchProgress(prev => ({ ...prev, done: products.length, current: '', errors: errorCount }))
     setBatchRunning(false)
     setSuccessToast(
-      errorCount === 0
-        ? `All ${successCount} products run successfully!`
-        : `${successCount} done, ${errorCount} failed.`
+      [
+        `${successCount} run on real sales history`,
+        errorCount > 0 ? `${errorCount} failed` : '',
+        skippedCount > 0 ? `${skippedCount} skipped (no recorded sales)` : '',
+      ].filter(Boolean).join(' · ')
     )
     setTimeout(() => { fetchPredictionHistory(); fetchDashboardIntelligence() }, 1200)
   }
@@ -660,6 +889,16 @@ export default function SalesForecast() {
 
   const combinedChartData = [...actualRows, ...forecastRows]
 
+  // Headline revenue reads off the same forecast the chart draws.
+  const forecastRevenue3m = forecastRows.reduce((s, r) => s + (r.adjusted || 0), 0)
+  const forecastMonthsLabel = forecastRows.length
+    ? `${forecastRows[0].month}–${forecastRows[forecastRows.length - 1].month}`
+    : ''
+  const fmtMoney = (v: number) =>
+    v >= 1_000_000 ? `$${(v / 1_000_000).toFixed(1)}M`
+    : v >= 1_000 ? `$${(v / 1_000).toFixed(1)}K`
+    : `$${Math.round(v)}`
+
   // Y-axis range: zoom in to the data range (±15%) so differences are visible
   const allValues = combinedChartData.flatMap(d => [d.actual, d.xgboost, d.adjusted].filter((v): v is number => v !== null && v > 0))
   const yMin = allValues.length > 0 ? Math.floor(Math.min(...allValues) * 0.90) : 0
@@ -717,38 +956,78 @@ export default function SalesForecast() {
         <>
           {/* ── STAT CARDS ── */}
           <div className="stat-grid">
-            <div className="stat-card" style={{ '--card-glow': '#6C63FF33', cursor: 'pointer' } as any} onClick={() => setStatCardModal('revenue')}>
-              <div className="stat-card-icon"><TrendingUp size={18} color="#6C63FF" /></div>
-              <div className="stat-card-label">Total Forecasted Revenue</div>
-              <div className="stat-card-value">
-                {dashLoading ? '...' : dashStats.forecastedRevenue > 0 ? `$${(dashStats.forecastedRevenue / 1000).toFixed(1)}K` : '—'}
-              </div>
-              <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>Across all AI-predicted products</div>
-            </div>
-            <div className="stat-card" style={{ '--card-glow': '#22d3a833', cursor: 'pointer' } as any} onClick={() => setStatCardModal('accuracy')}>
-              <div className="stat-card-icon"><Target size={18} color="#22d3a8" /></div>
-              <div className="stat-card-label">XGBoost Accuracy</div>
-              <div className="stat-card-value">94.2%</div>
-              <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>Trained on 54-store Ecuador dataset</div>
-            </div>
-            <div className="stat-card" style={{ '--card-glow': `${dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#00D4FF'}33`, cursor: 'pointer' } as any} onClick={() => setStatCardModal('sentiment')}>
-              <div className="stat-card-icon"><Activity size={18} color={dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#00D4FF'} /></div>
-              <div className="stat-card-label">Avg Market Sentiment</div>
-              <div className="stat-card-value" style={{ color: dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#fff' }}>
-                {dashLoading ? '...' : `x${dashStats.avgSentiment.toFixed(3)}`}
-              </div>
-              <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>
-                {dashStats.avgSentiment > 1.02 ? 'Market trending UP' : dashStats.avgSentiment < 0.98 ? 'Market trending DOWN' : 'Neutral baseline'}
-              </div>
-            </div>
-            <div className="stat-card" style={{ '--card-glow': '#FF6B9D33', cursor: 'pointer' } as any} onClick={() => setStatCardModal('executions')}>
-              <div className="stat-card-icon"><BarChart2 size={18} color="#FF6B9D" /></div>
-              <div className="stat-card-label">Pipeline Executions</div>
-              <div className="stat-card-value">{dashLoading ? '...' : dashStats.totalForecasts}</div>
-              <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>
-                {dashStats.productsNeedingRestock} product{dashStats.productsNeedingRestock !== 1 ? 's' : ''} flagged for restock
-              </div>
-            </div>
+            {(() => {
+              const sentColor = dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#00D4FF'
+              const cards = [
+                {
+                  // Same series the chart plots, so the headline figure and the
+                  // graph can no longer disagree. The old value summed per-product
+                  // model output, which sits on the training set's scale rather
+                  // than this catalogue's and read ~4x below actual monthly sales.
+                  id: 'revenue', color: '#6C63FF',
+                  icon: <TrendingUp size={18} color="#6C63FF" />,
+                  label: 'Forecast Revenue · Next 3 Months',
+                  value: forecastRevenue3m > 0 ? fmtMoney(forecastRevenue3m) : '—',
+                  sub: forecastMonthsLabel
+                    ? `${forecastMonthsLabel} · PPO + LLM adjusted`
+                    : 'Awaiting a complete month of sales',
+                  valueColor: undefined as string | undefined,
+                },
+                {
+                  id: 'accuracy', color: '#22d3a8',
+                  icon: <Target size={18} color="#22d3a8" />,
+                  label: 'XGBoost Accuracy',
+                  value: accuracyState === 'loading' ? '...'
+                    : accuracy ? `${accuracy.totalAccuracyPct.toFixed(1)}%` : '—',
+                  sub: accuracy
+                    ? `${accuracy.holdoutLabel} held out · calibrated on ${accuracy.calibrationLabel}`
+                    : accuracyState === 'loading' ? 'Running holdout backtest…'
+                    : accuracyError || 'Backtest unavailable',
+                  valueColor: accuracy
+                    ? (accuracy.totalAccuracyPct >= 90 ? '#22d3a8' : accuracy.totalAccuracyPct >= 70 ? '#f59e0b' : '#f43f5e')
+                    : undefined,
+                },
+                {
+                  id: 'sentiment', color: sentColor,
+                  icon: <Activity size={18} color={sentColor} />,
+                  label: 'Avg Market Sentiment',
+                  value: dashLoading ? '...' : `x${dashStats.avgSentiment.toFixed(3)}`,
+                  sub: dashStats.avgSentiment > 1.02 ? 'Market trending UP' : dashStats.avgSentiment < 0.98 ? 'Market trending DOWN' : 'Neutral baseline',
+                  valueColor: sentColor,
+                },
+                {
+                  id: 'executions', color: '#FF6B9D',
+                  icon: <BarChart2 size={18} color="#FF6B9D" />,
+                  label: 'Pipeline Executions',
+                  value: dashLoading ? '...' : String(dashStats.totalForecasts),
+                  sub: `${dashStats.productsNeedingRestock} product${dashStats.productsNeedingRestock !== 1 ? 's' : ''} flagged for restock`,
+                  valueColor: undefined as string | undefined,
+                },
+              ]
+              return cards.map(c => (
+                <div
+                  key={c.id}
+                  className="stat-card"
+                  onClick={() => setStatCardModal(c.id as any)}
+                  style={{ '--card-glow': `${c.color}33`, cursor: 'pointer', transition: 'box-shadow 0.25s ease, transform 0.18s ease' } as any}
+                  onMouseEnter={e => {
+                    const el = e.currentTarget as HTMLElement
+                    el.style.boxShadow = `0 0 0 1px ${c.color}99, 0 0 30px ${c.color}77, 0 0 60px ${c.color}44`
+                    el.style.transform = 'translateY(-2px)'
+                  }}
+                  onMouseLeave={e => {
+                    const el = e.currentTarget as HTMLElement
+                    el.style.boxShadow = ''; el.style.transform = ''
+                  }}
+                >
+                  <div className="stat-card-icon">{c.icon}</div>
+                  <div className="stat-card-label">{c.label}</div>
+                  <div className="stat-card-value" style={c.valueColor ? { color: c.valueColor } : {}}>{c.value}</div>
+                  <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>{c.sub}</div>
+                  <div style={{ fontSize: 10, color: `${c.color}99`, marginTop: 6, fontWeight: 500 }}>Click for details →</div>
+                </div>
+              ))
+            })()}
           </div>
 
           {/* ── MAIN ROW: Line Chart + AI Models Panel ── */}
@@ -808,12 +1087,45 @@ export default function SalesForecast() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, fontSize: 13, color: '#a78bfa' }}>
                     <BarChart2 size={14} /> XGBoost Demand Forecast
                   </div>
-                  <span className="badge badge-accent" style={{ fontSize: 10 }}>94.2%</span>
+                  <span
+                    className="badge"
+                    style={{
+                      fontSize: 10,
+                      background: accuracy ? 'rgba(34,211,168,0.18)' : 'rgba(255,255,255,0.08)',
+                      color: accuracy
+                        ? (accuracy.totalAccuracyPct >= 90 ? '#22d3a8' : accuracy.totalAccuracyPct >= 70 ? '#f59e0b' : '#f43f5e')
+                        : 'rgba(255,255,255,0.5)',
+                      border: '1px solid rgba(255,255,255,0.15)',
+                    }}
+                  >
+                    {accuracyState === 'loading' ? 'measuring…'
+                      : accuracy ? `${accuracy.totalAccuracyPct.toFixed(1)}% accurate` : 'not measured'}
+                  </span>
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginBottom: 8 }}>
                   12 features • 54 stores • Ecuador supply chain training set
                 </div>
-                <div className="progress-bar"><div className="progress-fill" style={{ width: '94.2%', background: '#6C63FF' }} /></div>
+                {/* Say which engine actually answered. Both loaders fall back
+                    silently, so "XGBoost" is a claim until the backend confirms it. */}
+                <div style={{ fontSize: 11, marginBottom: 8, color: modelStatus
+                  ? (modelStatus.xgboost?.loaded ? '#22d3a8' : '#f43f5e')
+                  : 'var(--clr-text-muted)' }}>
+                  {modelStatus
+                    ? (modelStatus.xgboost?.loaded
+                        ? '● Model binary loaded — predictions are XGBoost'
+                        : `● Model NOT loaded — serving ${modelStatus.xgboost?.engine}`)
+                    : '○ Engine unconfirmed (backend unreachable)'}
+                </div>
+                {accuracy && (
+                  <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginBottom: 8 }}>
+                    {accuracy.holdoutLabel} holdout · total demand within{' '}
+                    <strong style={{ color: '#fff' }}>{(100 - accuracy.totalAccuracyPct).toFixed(1)}%</strong>
+                    {' '}· per-family median {accuracy.medianFamilyAccuracyPct.toFixed(0)}%
+                  </div>
+                )}
+                <div className="progress-bar">
+                  <div className="progress-fill" style={{ width: `${accuracy ? Math.min(100, accuracy.totalAccuracyPct) : 0}%`, background: '#6C63FF' }} />
+                </div>
               </div>
 
               {/* LLM */}
@@ -993,10 +1305,119 @@ export default function SalesForecast() {
           <div className="grid-21" style={{ marginBottom: 16 }}>
             {/* Stock Action Recommendations */}
             <div className="glass-card">
-              <div className="section-title">
-                <span>AI Stock Action Recommendations</span>
-                <Sparkles size={15} color="var(--clr-accent-2)" />
+              <div className="section-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span>AI Stock Action Recommendations</span>
+                  <Sparkles size={15} color="var(--clr-accent-2)" />
+                </div>
+                {stockActions.length > 0 && (
+                  <button
+                    disabled={fixingAll}
+                    onClick={async () => {
+                      setFixingAll(true)
+                      setFixAllResult(null)
+                      const norm = (s: string) => (s || '').trim().toUpperCase()
+                      const { data: vdata } = await supabase.from('vendors').select('*').eq('status', 'Active')
+                      const allVendors: any[] = vdata || []
+                      let done = 0, skipped = 0
+                      const errors: string[] = []
+
+                      for (const item of stockActions) {
+                        // The order-up-to quantity, not the stored PPO figure.
+                        // PPO's number is computed against the stock level at
+                        // pipeline time and lands below the reorder point, so
+                        // ordering it left the alert standing.
+                        const reorderQty = item.recommended_qty > 0
+                          ? item.recommended_qty
+                          : Math.max(item.total_forecasted_demand || 0, Math.round((item.reorder_level_live || 0) * 1.5))
+
+                        const matching = allVendors.filter(v => norm(v.category) === norm(item.family || ''))
+                        if (matching.length === 0) {
+                          errors.push(`${item.product_name}: no vendor for "${item.family}"`)
+                          skipped++
+                          continue
+                        }
+
+                        const vendor = [...matching].sort((a, b) => a.lead_time_days - b.lead_time_days)[0]
+
+                        const { data: prod } = await supabase
+                          .from('products').select('unit_price, id').ilike('name', item.product_name).limit(1).single()
+                        const unitCost = prod ? parseFloat(prod.unit_price || '0') * 0.6 : 0
+                        const total    = Math.round(reorderQty * unitCost)
+                        const now      = new Date().toISOString()
+                        const delivDate = new Date(); delivDate.setDate(delivDate.getDate() + (vendor.lead_time_days || 7))
+
+                        await supabase.from('restock_orders').insert({
+                          vendor_id: vendor.id, vendor_name: vendor.company, vendor_email: vendor.email,
+                          items: [{
+                            product_name: item.product_name,
+                            sku: prod?.id ? skuFor(prod.id) : '',
+                            quantity: reorderQty,
+                            unit_cost: unitCost,
+                          }],
+                          total_cost: total, status: 'Pending',
+                          notes: `AI Fix-All restock — ${item.urgency} · to ${ORDER_UP_TO_DAYS}d cover`,
+                          expected_delivery: delivDate.toISOString().split('T')[0],
+                          ordered_at: now,
+                        })
+
+                        // Note: no financial_transactions write — Payment page reads procurement
+                        // totals directly from restock_orders.total_cost to avoid double-counting.
+
+                        if (item.inventory_id) {
+                          await supabase.from('inventory')
+                            .update({ current_stock: (item.current_stock_live || 0) + reorderQty, last_updated: now })
+                            .eq('id', item.inventory_id)
+                        } else if (prod?.id) {
+                          await supabase.from('inventory')
+                            .update({ current_stock: (item.current_stock_live || 0) + reorderQty, last_updated: now })
+                            .eq('product_id', prod.id)
+                        }
+
+                        done++
+                      }
+
+                      // Re-derive the list from the database rather than
+                      // filtering it locally. The old optimistic filter guessed
+                      // at what should remain and was overwritten by the next
+                      // refresh anyway; refetching shows what is actually true,
+                      // including any item the new stock level did not clear.
+                      setFixAllResult({ done, skipped, errors })
+                      await fetchDashboardIntelligence()
+                      setFixingAll(false)
+                    }}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 7,
+                      padding: '7px 16px', borderRadius: 10, fontSize: 12, fontWeight: 700,
+                      border: '1px solid rgba(108,99,255,0.6)',
+                      background: fixingAll ? 'rgba(108,99,255,0.12)' : 'rgba(108,99,255,0.22)',
+                      color: '#a78bfa', cursor: fixingAll ? 'wait' : 'pointer',
+                      opacity: fixingAll ? 0.7 : 1,
+                      boxShadow: fixingAll ? 'none' : '0 0 0 1px rgba(108,99,255,0.5), 0 0 18px rgba(108,99,255,0.4), 0 0 40px rgba(108,99,255,0.2)',
+                      transition: 'box-shadow 0.3s ease, background 0.2s',
+                      animation: fixingAll ? 'none' : undefined,
+                    }}
+                    onMouseEnter={e => { if (!fixingAll) (e.currentTarget as HTMLElement).style.boxShadow = '0 0 0 1px rgba(108,99,255,0.8), 0 0 28px rgba(108,99,255,0.6), 0 0 60px rgba(108,99,255,0.3)' }}
+                    onMouseLeave={e => { if (!fixingAll) (e.currentTarget as HTMLElement).style.boxShadow = '0 0 0 1px rgba(108,99,255,0.5), 0 0 18px rgba(108,99,255,0.4), 0 0 40px rgba(108,99,255,0.2)' }}
+                  >
+                    {fixingAll
+                      ? <><RefreshCw size={12} style={{ animation: 'spin 1s linear infinite' }} /> Fixing…</>
+                      : <><Zap size={12} /> Fix All ({stockActions.length})</>
+                    }
+                  </button>
+                )}
               </div>
+
+              {fixAllResult && (
+                <div style={{ marginBottom: 12, padding: '10px 14px', borderRadius: 10, fontSize: 12,
+                  background: fixAllResult.skipped === 0 ? 'rgba(34,211,168,0.1)' : 'rgba(245,158,11,0.1)',
+                  border: `1px solid ${fixAllResult.skipped === 0 ? 'rgba(34,211,168,0.35)' : 'rgba(245,158,11,0.35)'}`,
+                  color: fixAllResult.skipped === 0 ? '#22d3a8' : '#f59e0b' }}>
+                  ✓ {fixAllResult.done} order{fixAllResult.done !== 1 ? 's' : ''} placed
+                  {fixAllResult.skipped > 0 && ` · ${fixAllResult.skipped} need a vendor`}
+                </div>
+              )}
+
               {stockActions.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--clr-text-muted)', fontSize: 13 }}>
                   {dashLoading ? 'Computing recommendations...' : 'Run the pipeline on your products to generate AI-driven restock recommendations.'}
@@ -1007,14 +1428,15 @@ export default function SalesForecast() {
                     const glowColor = item.urgency === 'CRITICAL' ? '244,63,94' : item.urgency === 'HIGH' ? '245,158,11' : '34,211,168'
                     return (
                     <div key={i}
+                      onClick={() => setSelectedAction(item)}
                       style={{
-                        padding: 14, borderRadius: 'var(--r-md)',
+                        padding: 14, borderRadius: 'var(--r-md)', cursor: 'pointer',
                         background: item.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.08)' : item.urgency === 'HIGH' ? 'rgba(245,158,11,0.08)' : 'rgba(34,211,168,0.06)',
                         border: `1px solid ${item.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.85)' : item.urgency === 'HIGH' ? 'rgba(245,158,11,0.85)' : 'rgba(34,211,168,0.75)'}`,
-                        transition: 'box-shadow 0.25s ease',
+                        transition: 'box-shadow 0.25s ease, transform 0.18s ease',
                       }}
-                      onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px rgba(${glowColor},0.4), 0 0 18px rgba(${glowColor},0.45), 0 0 40px rgba(${glowColor},0.25)` }}
-                      onMouseLeave={e => { e.currentTarget.style.boxShadow = '' }}
+                      onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px rgba(${glowColor},0.4), 0 0 18px rgba(${glowColor},0.45), 0 0 40px rgba(${glowColor},0.25)`; e.currentTarget.style.transform = 'translateX(3px)' }}
+                      onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
                     >
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 }}>
                         <div>
@@ -1026,18 +1448,38 @@ export default function SalesForecast() {
                           }}>{item.urgency}</span>
                         </div>
                         <div style={{ textAlign: 'right' }}>
-                          <div style={{ fontSize: 20, fontWeight: 800, color: '#22d3a8', lineHeight: 1 }}>+{item.optimal_reorder_qty}</div>
-                          <div style={{ fontSize: 10, color: 'var(--clr-text-muted)' }}>units (PPO)</div>
+                          {/* Show the quantity that will actually be ordered,
+                              so the number on screen is the one that clears
+                              the alert rather than PPO's stale figure. */}
+                          <div style={{ fontSize: 20, fontWeight: 800, color: '#22d3a8', lineHeight: 1 }}>
+                            +{item.recommended_qty}
+                          </div>
+                          <div style={{ fontSize: 10, color: 'var(--clr-text-muted)' }}>
+                            units → {ORDER_UP_TO_DAYS}d cover
+                          </div>
+                          {item.ppo_reorder_qty > 0 && item.ppo_reorder_qty !== item.recommended_qty && (
+                            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', marginTop: 2 }}>
+                              PPO said +{item.ppo_reorder_qty}
+                            </div>
+                          )}
                         </div>
                       </div>
                       <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)', lineHeight: 1.6 }}>
                         Stock <strong style={{ color: item.current_stock_live < item.reorder_level_live ? '#f43f5e' : '#fff' }}>{item.current_stock_live}</strong> units
                         ({item.days_of_stock > 500 ? '∞' : item.days_of_stock} days supply)
+                        · Sells <strong style={{ color: '#00D4FF' }}>{item.daily_demand}/day</strong>
+                        <span style={{ color: 'rgba(255,255,255,0.35)' }}> ({item.demand_basis})</span>
                         · XGBoost forecast: <strong style={{ color: '#a78bfa' }}>{item.total_forecasted_demand} units/{item.forecast_period}</strong>
                         · Sentiment: <strong style={{ color: item.sentiment_multiplier > 1.02 ? '#22d3a8' : item.sentiment_multiplier < 0.98 ? '#f43f5e' : '#fff' }}>
                           x{parseFloat(item.sentiment_multiplier).toFixed(3)} {item.sentiment_multiplier > 1.02 ? '↑' : item.sentiment_multiplier < 0.98 ? '↓' : '─'}
                         </strong>
                       </div>
+                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginTop: 4 }}>
+                        Ordering <strong style={{ color: '#22d3a8' }}>+{item.recommended_qty}</strong> takes it to{' '}
+                        <strong style={{ color: '#fff' }}>{item.days_after_restock}</strong> days — clear of the{' '}
+                        {REORDER_POINT_DAYS}-day reorder point, so it leaves this list.
+                      </div>
+                      <div style={{ fontSize: 10, color: `rgba(${glowColor},0.7)`, marginTop: 6, fontWeight: 500 }}>Click to analyze →</div>
                     </div>
                   )})}
                 </div>
@@ -1046,11 +1488,30 @@ export default function SalesForecast() {
 
             {/* Model Accuracy Details */}
             <div className="glass-card">
-              <div className="section-title">Model Performance Metrics</div>
+              <div className="section-title">Live Pipeline Coverage</div>
               {[
-                { name: 'XGBoost Demand Forecast', value: 94.2, color: '#6C63FF', sub: 'RMSLE accuracy on Ecuador store test set' },
-                { name: 'LLM Sentiment (OpenRouter)', value: Math.min(98, Math.round(Math.abs(dashStats.avgSentiment - 1.0) * 200 + 72)), color: '#00D4FF', sub: 'GPT-4o-mini structured market signal precision' },
-                { name: 'PPO Reinforcement Agent', value: 87, color: '#22d3a8', sub: 'Inventory cost-to-service efficiency score' },
+                {
+                  name: 'Products With A Live Forecast',
+                  value: products.length > 0 ? Math.round((productForecasts.length / products.length) * 100) : 0,
+                  color: '#6C63FF',
+                  sub: `${productForecasts.length} of ${products.length} products returned by the AI pipeline`,
+                },
+                {
+                  name: 'Forecasts Backed By Real Sales',
+                  value: productForecasts.length > 0
+                    ? Math.round((productForecasts.filter((f: any) => Array.isArray(f.historical_sales) && f.historical_sales.length > 0).length / productForecasts.length) * 100)
+                    : 0,
+                  color: '#00D4FF',
+                  sub: 'Share of runs fed recorded sales_transactions history',
+                },
+                {
+                  name: 'Products Flagged For Restock',
+                  value: productForecasts.length > 0
+                    ? Math.round((dashStats.productsNeedingRestock / productForecasts.length) * 100)
+                    : 0,
+                  color: '#22d3a8',
+                  sub: `${dashStats.productsNeedingRestock} of ${productForecasts.length} forecast products need reordering`,
+                },
               ].map(m => (
                 <div key={m.name} style={{ marginBottom: 16 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 3 }}>
@@ -1772,6 +2233,229 @@ export default function SalesForecast() {
           </div>
         </div>
       )}
+      {/* ── AI STOCK ACTION DETAIL MODAL ── */}
+      {selectedAction && createPortal(
+        <div onClick={() => { setSelectedAction(null); setApproveMsg(null) }} style={{ position: 'fixed', inset: 0, zIndex: 10500, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(10px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+          <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 620, maxHeight: '88vh', overflowY: 'auto', background: 'rgba(8,10,22,0.97)', border: `1px solid ${selectedAction.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.5)' : selectedAction.urgency === 'HIGH' ? 'rgba(245,158,11,0.5)' : 'rgba(34,211,168,0.5)'}`, borderRadius: 22, padding: 32, boxShadow: `0 0 0 1px ${selectedAction.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.2)' : selectedAction.urgency === 'HIGH' ? 'rgba(245,158,11,0.2)' : 'rgba(34,211,168,0.2)'}, 0 32px 80px rgba(0,0,0,0.8)`, animation: 'pageIn 0.2s ease-out' }}>
+            {/* Header */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24 }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+                  <h2 style={{ fontSize: 20, fontWeight: 800, color: '#fff', margin: 0 }}>{selectedAction.product_name}</h2>
+                  <span className="badge badge-accent">{selectedAction.family}</span>
+                  <span style={{ fontSize: 11, padding: '3px 8px', borderRadius: 8, fontWeight: 700, background: selectedAction.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.2)' : selectedAction.urgency === 'HIGH' ? 'rgba(245,158,11,0.2)' : 'rgba(34,211,168,0.15)', color: selectedAction.urgency === 'CRITICAL' ? '#f43f5e' : selectedAction.urgency === 'HIGH' ? '#f59e0b' : '#22d3a8' }}>{selectedAction.urgency}</span>
+                </div>
+                <p style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)', margin: 0 }}>AI-driven stock intelligence analysis</p>
+              </div>
+              <button onClick={() => { setSelectedAction(null); setApproveMsg(null) }} style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10, padding: '7px 11px', cursor: 'pointer', color: 'rgba(255,255,255,0.6)', display: 'flex', alignItems: 'center' }}><X size={16} /></button>
+            </div>
+
+            {/* Stock status bar */}
+            {(() => {
+              const max = Math.max(selectedAction.reorder_level_live * 2, selectedAction.current_stock_live, 1)
+              const pct = Math.min((selectedAction.current_stock_live / max) * 100, 100)
+              const reorderPct = Math.min((selectedAction.reorder_level_live / max) * 100, 100)
+              const barColor = selectedAction.current_stock_live === 0 ? '#f43f5e' : selectedAction.current_stock_live < selectedAction.reorder_level_live ? '#f59e0b' : '#22d3a8'
+              return (
+                <div style={{ marginBottom: 22 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
+                    <span style={{ color: 'rgba(255,255,255,0.5)' }}>Inventory Level</span>
+                    <span style={{ color: barColor, fontWeight: 700 }}>{selectedAction.current_stock_live} / {selectedAction.reorder_level_live} reorder point</span>
+                  </div>
+                  <div style={{ height: 10, borderRadius: 5, background: 'rgba(255,255,255,0.07)', position: 'relative', overflow: 'hidden' }}>
+                    <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${pct}%`, background: barColor, borderRadius: 5, transition: 'width 0.4s ease', boxShadow: `0 0 8px ${barColor}88` }} />
+                    <div style={{ position: 'absolute', left: `${reorderPct}%`, top: 0, height: '100%', width: 2, background: 'rgba(255,255,255,0.4)' }} />
+                  </div>
+                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 4 }}>
+                    {selectedAction.days_of_stock > 500 ? '∞ days' : `${selectedAction.days_of_stock} days`} of supply remaining
+                  </div>
+                </div>
+              )
+            })()}
+
+            {/* 3-column stat tiles */}
+            <div style={{ display: 'flex', gap: 10, marginBottom: 22, flexWrap: 'wrap' }}>
+              {[
+                { label: 'XGBoost Demand', value: `${selectedAction.total_forecasted_demand} units`, sub: `over ${selectedAction.forecast_period}`, color: '#a78bfa' },
+                { label: 'Daily Rate', value: `${selectedAction.daily_demand}/day`, sub: 'avg demand', color: '#00D4FF' },
+                { label: 'Forecasted Revenue', value: `$${(selectedAction.forecasted_revenue || 0).toLocaleString()}`, sub: `${selectedAction.forecast_period} outlook`, color: '#22d3a8' },
+              ].map(t => (
+                <div key={t.label} style={{ flex: '1 1 130px', padding: '13px 15px', borderRadius: 12, background: `${t.color}0d`, border: `1px solid ${t.color}30` }}>
+                  <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{t.label}</div>
+                  <div style={{ fontSize: 17, fontWeight: 800, color: t.color }}>{t.value}</div>
+                  <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 2 }}>{t.sub}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Sentiment + PPO row */}
+            <div style={{ display: 'flex', gap: 12, marginBottom: 22 }}>
+              <div style={{ flex: 1, padding: '14px 16px', borderRadius: 14, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>LLM Market Sentiment</div>
+                <div style={{ fontSize: 28, fontWeight: 800, color: selectedAction.sentiment_multiplier > 1.02 ? '#22d3a8' : selectedAction.sentiment_multiplier < 0.98 ? '#f43f5e' : '#fff', lineHeight: 1, marginBottom: 4 }}>
+                  x{parseFloat(selectedAction.sentiment_multiplier).toFixed(3)}
+                  {' '}{selectedAction.sentiment_multiplier > 1.02 ? '↑' : selectedAction.sentiment_multiplier < 0.98 ? '↓' : '─'}
+                </div>
+                <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)' }}>
+                  {selectedAction.sentiment_multiplier > 1.02 ? 'Positive market signal — demand boosted' : selectedAction.sentiment_multiplier < 0.98 ? 'Negative market signal — demand reduced' : 'Neutral market conditions'}
+                </div>
+              </div>
+              <div style={{ flex: 1, padding: '14px 16px', borderRadius: 14, background: 'rgba(34,211,168,0.06)', border: '1px solid rgba(34,211,168,0.2)' }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>PPO RL Recommendation</div>
+                {(() => {
+                  const rec = selectedAction.recommended_qty || Math.max(selectedAction.total_forecasted_demand, Math.round((selectedAction.reorder_level_live || 0) * 1.5))
+                  const isPPO = (selectedAction.ppo_reorder_qty || 0) > 0
+                  return (
+                    <>
+                      <div style={{ fontSize: 28, fontWeight: 800, color: '#22d3a8', lineHeight: 1, marginBottom: 4 }}>+{rec} units</div>
+                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)' }}>
+                        {isPPO ? 'PPO agent direct output' : 'Calculated from demand forecast'}
+                      </div>
+                    </>
+                  )
+                })()}
+              </div>
+            </div>
+
+            {/* Sentiment analysis text */}
+            {selectedAction.sentiment_analysis && (
+              <div style={{ marginBottom: 22, padding: '14px 16px', borderRadius: 12, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.35)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>Analyst Conclusion</div>
+                <p style={{ fontSize: 12.5, lineHeight: 1.7, color: 'rgba(240,242,255,0.65)', margin: 0 }}>{selectedAction.sentiment_analysis}</p>
+              </div>
+            )}
+
+            {/* First 10 day forecast chips */}
+            {Array.isArray(selectedAction.forecasted_demand) && selectedAction.forecasted_demand.length > 0 && (
+              <div style={{ marginBottom: 22 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.35)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>Daily Demand Forecast (First 10 Days)</div>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {selectedAction.forecasted_demand.slice(0, 10).map((val: number, di: number) => (
+                    <div key={di} style={{ padding: '5px 10px', background: 'rgba(108,99,255,0.12)', borderRadius: 8, fontSize: 11, color: '#a78bfa', fontWeight: 600 }}>
+                      Day {di + 1}: {Math.round(val)}
+                    </div>
+                  ))}
+                  {selectedAction.forecasted_demand.length > 10 && (
+                    <div style={{ padding: '5px 10px', background: 'rgba(255,255,255,0.04)', borderRadius: 8, fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>
+                      +{selectedAction.forecasted_demand.length - 10} more…
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Action button */}
+            <div style={{ padding: '14px 16px', borderRadius: 12, background: selectedAction.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.08)' : 'rgba(34,211,168,0.06)', border: `1px solid ${selectedAction.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.25)' : 'rgba(34,211,168,0.2)'}` }}>
+              <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 10 }}>
+                {selectedAction.urgency === 'CRITICAL' ? '⚠️ Immediate action required — stock critically low or depleted.' : 'Approving will create a vendor purchase order and update the Restock queue.'}
+              </div>
+
+              {approveMsg && (
+                <div style={{ marginBottom: 10, padding: '9px 13px', borderRadius: 9, fontSize: 12, fontWeight: 600,
+                  background: approveMsg.type === 'error' ? 'rgba(244,63,94,0.12)' : 'rgba(34,211,168,0.12)',
+                  border: `1px solid ${approveMsg.type === 'error' ? 'rgba(244,63,94,0.35)' : 'rgba(34,211,168,0.35)'}`,
+                  color: approveMsg.type === 'error' ? '#f43f5e' : '#22d3a8' }}>
+                  {approveMsg.text}
+                </div>
+              )}
+
+              <button
+                disabled={approving}
+                onClick={async () => {
+                  setApproving(true)
+                  setApproveMsg(null)
+
+                  // Order-up-to quantity, matching the Fix All path, so
+                  // approving one item actually clears its alert too.
+                  const reorderQty = selectedAction.recommended_qty > 0
+                    ? selectedAction.recommended_qty
+                    : Math.max(selectedAction.total_forecasted_demand || 0, Math.round((selectedAction.reorder_level_live || 0) * 1.5))
+
+                  const norm = (s: string) => (s || '').trim().toUpperCase()
+
+                  // 1. Find active vendor for this product family
+                  const { data: vdata } = await supabase
+                    .from('vendors')
+                    .select('*')
+                    .eq('status', 'Active')
+
+                  const matching = (vdata || []).filter((v: any) => norm(v.category) === norm(selectedAction.family || ''))
+                  if (matching.length === 0) {
+                    setApproveMsg({ type: 'error', text: `No active vendor found for "${selectedAction.family}". Add one in Restock → Vendor Directory first.` })
+                    setApproving(false)
+                    return
+                  }
+
+                  // Pick vendor with lowest lead time
+                  const vendor = [...matching].sort((a: any, b: any) => a.lead_time_days - b.lead_time_days)[0]
+
+                  // 2. Fetch unit cost from products table
+                  const { data: prod } = await supabase
+                    .from('products')
+                    .select('unit_price, id')
+                    .ilike('name', selectedAction.product_name)
+                    .limit(1)
+                    .single()
+                  const unitCost = prod ? parseFloat(prod.unit_price || '0') * 0.6 : 0
+                  const total    = Math.round(reorderQty * unitCost)
+
+                  const delivDate = new Date()
+                  delivDate.setDate(delivDate.getDate() + (vendor.lead_time_days || 7))
+                  const delivStr = delivDate.toISOString().split('T')[0]
+                  const now      = new Date().toISOString()
+
+                  // 3. Create proper restock_orders record
+                  await supabase.from('restock_orders').insert({
+                    vendor_id:         vendor.id,
+                    vendor_name:       vendor.company,
+                    vendor_email:      vendor.email,
+                    items:             [{ product_name: selectedAction.product_name, sku: '', quantity: reorderQty, unit_cost: unitCost }],
+                    total_cost:        total,
+                    status:            'Pending',
+                    notes:             `AI emergency restock — ${selectedAction.urgency} urgency`,
+                    expected_delivery: delivStr,
+                    ordered_at:        now,
+                  })
+
+                  // Note: no financial_transactions write — Payment page reads procurement
+                  // totals directly from restock_orders.total_cost to avoid double-counting.
+
+                  // 5. Update inventory so item leaves the restock queue
+                  const invId = selectedAction.inventory_id
+                  if (invId) {
+                    await supabase.from('inventory')
+                      .update({ current_stock: (selectedAction.current_stock_live || 0) + reorderQty, last_updated: now })
+                      .eq('id', invId)
+                  } else if (prod?.id) {
+                    await supabase.from('inventory')
+                      .update({ current_stock: (selectedAction.current_stock_live || 0) + reorderQty, last_updated: now })
+                      .eq('product_id', prod.id)
+                  }
+
+                  setApproveMsg({ type: 'success', text: `✓ Order placed with ${vendor.company} for ${reorderQty} units. Navigating to Restock…` })
+                  setApproving(false)
+                  setTimeout(() => {
+                    setSelectedAction(null)
+                    setApproveMsg(null)
+                    navigate('/owner/restock')
+                  }, 1800)
+                }}
+                style={{ padding: '10px 20px', borderRadius: 10, opacity: approving ? 0.6 : 1,
+                  background: selectedAction.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.25)' : 'rgba(34,211,168,0.15)',
+                  border: `1px solid ${selectedAction.urgency === 'CRITICAL' ? 'rgba(244,63,94,0.5)' : 'rgba(34,211,168,0.4)'}`,
+                  color: selectedAction.urgency === 'CRITICAL' ? '#f43f5e' : '#22d3a8',
+                  fontWeight: 700, cursor: approving ? 'wait' : 'pointer', fontSize: 13, transition: 'box-shadow 0.2s' }}
+                onMouseEnter={e => { if (!approving) (e.currentTarget as HTMLElement).style.boxShadow = selectedAction.urgency === 'CRITICAL' ? '0 0 0 1px rgba(244,63,94,0.6), 0 0 18px rgba(244,63,94,0.3)' : '0 0 0 1px rgba(34,211,168,0.6), 0 0 18px rgba(34,211,168,0.3)' }}
+                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.boxShadow = '' }}
+              >
+                {approving ? '⏳ Processing…' : selectedAction.urgency === 'CRITICAL' ? '🚨 Approve Emergency Restock' : '✓ Approve & Send to Restock'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
       {/* ── STAT CARD MODALS ── */}
       {statCardModal && createPortal(
         <div
@@ -1793,7 +2477,12 @@ export default function SalesForecast() {
                 {statCardModal === 'llm' && 'LLM Market Sentiment Engine'}
                 {statCardModal === 'ppo' && 'PPO Reinforcement Learning Agent'}
               </div>
-              <button onClick={() => setStatCardModal(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)', padding: 4 }}>
+              <button
+                onClick={() => setStatCardModal(null)}
+                style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 9, cursor: 'pointer', color: 'rgba(255,255,255,0.5)', padding: 6, transition: 'box-shadow 0.2s ease, color 0.2s ease' }}
+                onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 0 0 1px rgba(244,63,94,0.5), 0 0 14px rgba(244,63,94,0.35)'; e.currentTarget.style.color = '#f43f5e' }}
+                onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.color = 'rgba(255,255,255,0.5)' }}
+              >
                 <X size={18} />
               </button>
             </div>
@@ -1807,7 +2496,10 @@ export default function SalesForecast() {
                 {productForecasts.length === 0 ? (
                   <div style={{ color: 'var(--clr-text-muted)', fontSize: 13, textAlign: 'center', padding: 24 }}>Run the pipeline on products to see revenue breakdown.</div>
                 ) : [...productForecasts].sort((a, b) => b.forecasted_revenue - a.forecasted_revenue).map((f: any) => (
-                  <div key={f.product_id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                  <div key={f.product_id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)', transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                    onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 0 0 1px rgba(108,99,255,0.5), 0 0 18px rgba(108,99,255,0.35)'; e.currentTarget.style.transform = 'translateX(2px)' }}
+                    onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                  >
                     <div style={{ flex: 1 }}>
                       <div style={{ fontWeight: 600, fontSize: 13, color: '#fff' }}>{f.product_name}</div>
                       <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginTop: 2 }}>{f.family} · {f.forecast_period} · {f.total_forecasted_demand} units</div>
@@ -1834,12 +2526,35 @@ export default function SalesForecast() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                   {[
-                    { label: 'RMSLE Accuracy', value: '94.2%', color: '#22d3a8', sub: 'Root Mean Squared Log Error' },
-                    { label: 'Training Stores', value: '54', color: '#6C63FF', sub: 'Corporación Favorita, Ecuador' },
-                    { label: 'Training Rows', value: '3M+', color: '#00D4FF', sub: 'Historical sales transactions' },
-                    { label: 'Feature Count', value: '12', color: '#f59e0b', sub: 'Input features per prediction' },
+                    {
+                      label: 'Total-Demand Accuracy',
+                      value: accuracy ? `${accuracy.totalAccuracyPct.toFixed(1)}%` : '—',
+                      color: '#22d3a8',
+                      sub: accuracy ? `${accuracy.holdoutLabel} holdout, never seen by the fit` : 'Backtest not available',
+                    },
+                    {
+                      label: 'Per-Family Median',
+                      value: accuracy ? `${accuracy.medianFamilyAccuracyPct.toFixed(0)}%` : '—',
+                      color: accuracy && accuracy.medianFamilyAccuracyPct >= 60 ? '#6C63FF' : '#f43f5e',
+                      sub: 'Category mix is far weaker than the total',
+                    },
+                    {
+                      label: 'Scale Factor',
+                      value: accuracy ? `x${accuracy.scaleFactor.toFixed(3)}` : '—',
+                      color: '#00D4FF',
+                      sub: accuracy ? `Fitted on ${accuracy.calibrationLabel} only` : 'Corrects training-set scale',
+                    },
+                    {
+                      label: 'Raw MAPE',
+                      value: accuracy ? `${accuracy.rawMape.toFixed(0)}%` : '—',
+                      color: '#f59e0b',
+                      sub: 'Uncalibrated error, before scaling',
+                    },
                   ].map(m => (
-                    <div key={m.label} style={{ padding: 14, borderRadius: 10, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                    <div key={m.label} style={{ padding: 14, borderRadius: 10, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                      onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${m.color}66, 0 0 18px ${m.color}44`; e.currentTarget.style.transform = 'translateY(-2px)' }}
+                      onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                    >
                       <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', marginBottom: 6 }}>{m.label}</div>
                       <div style={{ fontSize: 24, fontWeight: 800, color: m.color }}>{m.value}</div>
                       <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)', marginTop: 4 }}>{m.sub}</div>
@@ -1850,13 +2565,69 @@ export default function SalesForecast() {
                   <div style={{ fontSize: 11, fontWeight: 700, color: '#a78bfa', marginBottom: 10, textTransform: 'uppercase', letterSpacing: 1 }}>12 Model Features</div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                     {['store_nbr','product_family','onpromotion','city','state','store_type','cluster','oil_price (WTI)','day_of_week','month','year','is_weekend'].map(f => (
-                      <span key={f} style={{ padding: '3px 10px', borderRadius: 20, background: 'rgba(108,99,255,0.15)', fontSize: 11, color: '#a78bfa', border: '1px solid rgba(108,99,255,0.25)' }}>{f}</span>
+                      <span key={f} style={{ padding: '3px 10px', borderRadius: 20, background: 'rgba(108,99,255,0.15)', fontSize: 11, color: '#a78bfa', border: '1px solid rgba(108,99,255,0.25)', transition: 'box-shadow 0.2s ease', cursor: 'default' }}
+                        onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 0 10px rgba(108,99,255,0.6)' }}
+                        onMouseLeave={e => { e.currentTarget.style.boxShadow = '' }}
+                      >{f}</span>
                     ))}
                   </div>
                 </div>
-                <div style={{ padding: 14, borderRadius: 10, background: 'rgba(34,211,168,0.05)', border: '1px solid rgba(34,211,168,0.15)', fontSize: 12, color: 'rgba(255,255,255,0.55)', lineHeight: 1.7 }}>
+                <div style={{ padding: 14, borderRadius: 10, background: 'rgba(34,211,168,0.05)', border: '1px solid rgba(34,211,168,0.15)', fontSize: 12, color: 'rgba(255,255,255,0.55)', lineHeight: 1.7, transition: 'box-shadow 0.2s ease' }}
+                  onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 0 0 1px rgba(34,211,168,0.4), 0 0 16px rgba(34,211,168,0.25)' }}
+                  onMouseLeave={e => { e.currentTarget.style.boxShadow = '' }}
+                >
                   Trained on the Corporación Favorita grocery sales dataset (54 stores across Ecuador). The model predicts daily unit demand per product family using gradient-boosted trees. Live WTI oil price is injected at inference time as a real-world economic signal.
                 </div>
+
+                {accuracy && (
+                  <div style={{ padding: 14, borderRadius: 10, background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.22)', fontSize: 12, color: 'rgba(255,255,255,0.6)', lineHeight: 1.7 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 }}>
+                      How this was measured
+                    </div>
+                    The model ran over <strong style={{ color: '#fff' }}>{accuracy.holdoutLabel}</strong>, a month it was
+                    never given the outcome for. Because it was trained on a 54-store national dataset, its raw output is
+                    on a different scale entirely — <strong style={{ color: '#fff' }}>{Math.round(accuracy.rawPredictedTotal).toLocaleString()}</strong> units
+                    against <strong style={{ color: '#fff' }}>{Math.round(accuracy.actualTotal).toLocaleString()}</strong> actually
+                    sold. One scale factor fitted on <strong style={{ color: '#fff' }}>{accuracy.calibrationLabel}</strong> alone
+                    brings that to <strong style={{ color: '#22d3a8' }}>{Math.round(accuracy.calibratedTotal).toLocaleString()}</strong> units.
+                    <div style={{ marginTop: 8 }}>
+                      So the model tracks <em>total</em> demand well once scaled, but splits it across categories poorly —
+                      the per-family median is only {accuracy.medianFamilyAccuracyPct.toFixed(0)}%. Trust it for revenue
+                      totals, not for deciding which category to stock.
+                    </div>
+                  </div>
+                )}
+
+                {accuracy && accuracy.perFamily.length > 0 && (
+                  <div style={{ padding: 14, borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.5)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: 1 }}>
+                      Per-family error · {accuracy.holdoutLabel}
+                    </div>
+                    <div style={{ maxHeight: 230, overflowY: 'auto' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                        <thead>
+                          <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                            {['Family', 'Actual', 'Predicted', 'Error'].map(h => (
+                              <th key={h} style={{ textAlign: h === 'Family' ? 'left' : 'right', padding: '6px 4px', color: 'rgba(255,255,255,0.35)', fontWeight: 600, fontSize: 10 }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {accuracy.perFamily.map(r => (
+                            <tr key={r.family} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                              <td style={{ padding: '6px 4px', color: 'rgba(255,255,255,0.75)' }}>{r.family}</td>
+                              <td style={{ padding: '6px 4px', textAlign: 'right', color: 'rgba(255,255,255,0.55)' }}>{Math.round(r.actual).toLocaleString()}</td>
+                              <td style={{ padding: '6px 4px', textAlign: 'right', color: 'rgba(255,255,255,0.55)' }}>{Math.round(r.calibrated).toLocaleString()}</td>
+                              <td style={{ padding: '6px 4px', textAlign: 'right', fontWeight: 700, color: r.apePct <= 25 ? '#22d3a8' : r.apePct <= 60 ? '#f59e0b' : '#f43f5e' }}>
+                                {r.apePct.toFixed(0)}%
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1870,7 +2641,10 @@ export default function SalesForecast() {
                     { label: 'Neutral', value: productForecasts.filter((f:any) => parseFloat(f.sentiment_multiplier) >= 0.98 && parseFloat(f.sentiment_multiplier) <= 1.02).length, color: '#fff' },
                     { label: 'Negative', value: productForecasts.filter((f:any) => parseFloat(f.sentiment_multiplier) < 0.98).length, color: '#f43f5e' },
                   ].map(s => (
-                    <div key={s.label} style={{ flex: 1, padding: '10px 12px', borderRadius: 10, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)', textAlign: 'center' }}>
+                    <div key={s.label} style={{ flex: 1, padding: '10px 12px', borderRadius: 10, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)', textAlign: 'center', transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                      onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${s.color}66, 0 0 16px ${s.color}44`; e.currentTarget.style.transform = 'translateY(-2px)' }}
+                      onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                    >
                       <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
                       <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
                     </div>
@@ -1882,7 +2656,10 @@ export default function SalesForecast() {
                   const mult = parseFloat(f.sentiment_multiplier)
                   const color = mult > 1.02 ? '#22d3a8' : mult < 0.98 ? '#f43f5e' : '#fff'
                   return (
-                    <div key={f.product_id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                    <div key={f.product_id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                      onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${color}66, 0 0 18px ${color}44`; e.currentTarget.style.transform = 'translateX(2px)' }}
+                      onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                    >
                       <div style={{ flex: 1 }}>
                         <div style={{ fontWeight: 600, fontSize: 13, color: '#fff' }}>{f.product_name}</div>
                         <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)', marginTop: 2 }}>{f.family}</div>
@@ -1905,7 +2682,10 @@ export default function SalesForecast() {
                     { label: 'Products Run', value: productForecasts.length, color: '#6C63FF' },
                     { label: 'Need Restock', value: dashStats.productsNeedingRestock, color: '#f43f5e' },
                   ].map(s => (
-                    <div key={s.label} style={{ padding: '12px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)', textAlign: 'center' }}>
+                    <div key={s.label} style={{ padding: '12px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)', textAlign: 'center', transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                      onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${s.color}66, 0 0 18px ${s.color}44`; e.currentTarget.style.transform = 'translateY(-2px)' }}
+                      onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                    >
                       <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
                       <div style={{ fontSize: 22, fontWeight: 800, color: s.color }}>{s.value}</div>
                     </div>
@@ -1915,7 +2695,10 @@ export default function SalesForecast() {
                 {historyForecasts.length === 0 ? (
                   <div style={{ color: 'var(--clr-text-muted)', fontSize: 13, textAlign: 'center', padding: 24 }}>No pipeline runs yet.</div>
                 ) : historyForecasts.slice(0, 15).map((f: any, i: number) => (
-                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                    onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 0 0 1px rgba(255,107,157,0.5), 0 0 18px rgba(255,107,157,0.35)'; e.currentTarget.style.transform = 'translateX(2px)' }}
+                    onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                  >
                     <div style={{ flex: 1 }}>
                       <div style={{ fontWeight: 600, fontSize: 13, color: '#fff' }}>{f.product_name}</div>
                       <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)' }}>{new Date(f.predicted_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</div>
@@ -1936,7 +2719,7 @@ export default function SalesForecast() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                   {[
-                    { label: 'RMSLE Accuracy', value: '94.2%', color: '#6C63FF', sub: 'Root Mean Squared Log Error on test set' },
+                    { label: 'Live Forecasts', value: String(productForecasts.length), color: '#6C63FF', sub: 'Products with a current prediction' },
                     { label: 'Training Stores', value: '54', color: '#a78bfa', sub: 'Corporación Favorita, Ecuador' },
                     { label: 'Training Rows', value: '3M+', color: '#00D4FF', sub: 'Daily sales transactions' },
                     { label: 'Features', value: '12', color: '#f59e0b', sub: 'Per-prediction input features' },
@@ -1960,12 +2743,14 @@ export default function SalesForecast() {
                   Trained on the Corporación Favorita grocery sales dataset from 54 stores across Ecuador. Uses gradient-boosted decision trees to predict daily unit demand per product family. Live WTI crude oil price is injected at inference time to capture real-world cost pressures on consumer demand.
                 </div>
                 <div style={{ padding: 14, borderRadius: 10, background: 'rgba(108,99,255,0.06)', border: '1px solid rgba(108,99,255,0.2)' }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: '#a78bfa', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 }}>Accuracy on test set</div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: '#a78bfa', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 }}>Forecast coverage</div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <div style={{ flex: 1, height: 8, borderRadius: 4, background: 'rgba(255,255,255,0.08)' }}>
-                      <div style={{ height: '100%', borderRadius: 4, width: '94.2%', background: 'linear-gradient(90deg,#6C63FF,#a78bfa)' }} />
+                      <div style={{ height: '100%', borderRadius: 4, width: `${products.length > 0 ? Math.round((productForecasts.length / products.length) * 100) : 0}%`, background: 'linear-gradient(90deg,#6C63FF,#a78bfa)' }} />
                     </div>
-                    <span style={{ fontWeight: 800, color: '#a78bfa', fontSize: 16 }}>94.2%</span>
+                    <span style={{ fontWeight: 800, color: '#a78bfa', fontSize: 16 }}>
+                      {products.length > 0 ? Math.round((productForecasts.length / products.length) * 100) : 0}%
+                    </span>
                   </div>
                 </div>
               </div>

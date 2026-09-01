@@ -2,8 +2,11 @@ fastapi>=0.100.0
 uvicorn>=0.22.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
-xgboost>=1.7.0
-scikit-learn>=1.2.0
+# forecast_model.pkl was saved by xgboost 3.2.0; older majors cannot unpickle
+# it, and the loader swallows that failure and serves a statistical fallback
+# instead, so the floor has to match the artifact.
+xgboost>=3.2.0
+scikit-learn>=1.6.1
 pandas>=2.0.0
 numpy>=1.24.0
 anthropic>=0.5.0
@@ -12,3 +15,4 @@ httpx>=0.24.0
 stable-baselines3>=2.0.0
 gymnasium>=0.29.0
 torch>=2.0.0
+holidays>=0.45

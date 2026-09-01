@@ -352,9 +352,11 @@ export default function Employees() {
           <div
             key={s.label}
             className="stat-card"
-            style={{ '--card-glow': `${s.color}33`, cursor: 'pointer' } as any}
+            style={{ '--card-glow': `${s.color}33`, cursor: 'pointer', transition: 'box-shadow 0.25s ease, transform 0.18s ease' } as any}
             onClick={() => setStatModal(s.key)}
             title={`Click to view ${s.label}`}
+            onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = `0 0 0 1px ${s.color}99, 0 0 30px ${s.color}77, 0 0 60px ${s.color}44`; el.style.transform = 'translateY(-2px)' }}
+            onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = ''; el.style.transform = '' }}
           >
             <div className="stat-card-icon"><s.icon size={18} color={s.color} /></div>
             <div className="stat-card-label">{s.label}</div>

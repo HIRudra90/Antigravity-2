@@ -12,7 +12,8 @@ def log_prediction_to_supabase(
     sentiment_analysis: str,
     historical_sales: list[float],
     forecasted_demand: list[float],
-    optimal_reorder_qty: int
+    optimal_reorder_qty: int,
+    oil_price_used: float = 78.5,
 ) -> dict:
     """
     Logs prediction pipeline inputs and results into the Supabase 'demand_forecasts' table
@@ -41,7 +42,8 @@ def log_prediction_to_supabase(
         "sentiment_analysis": sentiment_analysis,
         "historical_sales": historical_sales,
         "forecasted_demand": forecasted_demand,
-        "optimal_reorder_qty": int(optimal_reorder_qty)
+        "optimal_reorder_qty": int(optimal_reorder_qty),
+        "oil_price_used": float(oil_price_used),
     }
     
     try:

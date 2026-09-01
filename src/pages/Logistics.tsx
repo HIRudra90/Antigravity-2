@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { supabase } from '../lib/supabaseClient'
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip,
-  ResponsiveContainer, CartesianGrid, PieChart, Pie, Cell,
+  ResponsiveContainer, CartesianGrid, PieChart, Pie, Cell, Sector,
 } from 'recharts'
 import {
   Truck, MapPin, Package, RefreshCw, Plus, X, ExternalLink, CheckCircle, Navigation,
@@ -521,7 +521,28 @@ function OrderDetailModal({ s, onClose }: { s: Shipment; onClose: () => void }) 
 const deliveryTime  = [{ company: 'J&T', time: 2.1 }, { company: 'Pos Laju', time: 2.5 }, { company: 'DHL', time: 1.8 }, { company: 'Ninja Van', time: 2.8 }]
 const shippingCost  = [{ month: 'Jan', cost: 1200 }, { month: 'Feb', cost: 1500 }, { month: 'Mar', cost: 1800 }, { month: 'Apr', cost: 1100 }, { month: 'May', cost: 2200 }, { month: 'Jun', cost: 1900 }]
 const providerUsage = [{ name: 'J&T', value: 40, color: '#6C63FF' }, { name: 'Pos Laju', value: 25, color: '#00D4FF' }, { name: 'DHL', value: 20, color: '#22d3a8' }, { name: 'Ninja Van', value: 15, color: '#FF6B9D' }]
+const carrierMeta: Record<string, { avgDays: number; reliability: string; coverage: string; tier: string; avgCost: string; strength: string }> = {
+  'J&T':       { avgDays: 2.1, reliability: '94%', coverage: 'Nationwide', tier: 'Budget',     avgCost: 'RM 8–15',   strength: 'Best for bulk orders & nationwide reach' },
+  'Pos Laju':  { avgDays: 2.5, reliability: '91%', coverage: 'Nationwide', tier: 'Budget',     avgCost: 'RM 7–12',   strength: 'Most affordable, strong rural coverage' },
+  'DHL':       { avgDays: 1.8, reliability: '98%', coverage: 'International', tier: 'Premium', avgCost: 'RM 20–50',  strength: 'Fastest delivery, best for high-value items' },
+  'Ninja Van': { avgDays: 2.8, reliability: '89%', coverage: 'Nationwide', tier: 'Mid-range',  avgCost: 'RM 10–20',  strength: 'Good for same-day in major cities' },
+}
 const ttStyle = { contentStyle: { background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px' }, labelStyle: { color: '#fff', fontWeight: 700, fontSize: 13 }, itemStyle: { fontSize: 12 } }
+
+function GlowSlice(props: any) {
+  const { cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill } = props
+  return (
+    <Sector
+      cx={cx} cy={cy}
+      innerRadius={innerRadius - 4}
+      outerRadius={outerRadius + 14}
+      startAngle={startAngle}
+      endAngle={endAngle}
+      fill={fill}
+      style={{ filter: `drop-shadow(0 0 10px ${fill}) drop-shadow(0 0 22px ${fill}cc)` }}
+    />
+  )
+}
 
 // ─── Main Component ────────────────────────────────────────────────────────────
 export default function Logistics() {
@@ -531,6 +552,14 @@ export default function Logistics() {
   const [showNew, setShowNew] = useState(false)
   const [viewing, setViewing] = useState<Shipment | null>(null)
   const [customerId, setCustomerId] = useState<number | null>(null)
+  const [activeCarrierIdx, setActiveCarrierIdx] = useState<number | null>(null)
+  const [hoverCarrierIdx, setHoverCarrierIdx] = useState<number | null>(null)
+  const [modalCard, setModalCard] = useState<string | null>(null)
+  // Hover previews on top of whatever's pinned by a click; leaving the chart
+  // falls back to the pinned slice instead of clearing the panel.
+  const displayCarrierIdx = hoverCarrierIdx ?? activeCarrierIdx
+  const activeCarrier = displayCarrierIdx !== null ? providerUsage[displayCarrierIdx] : null
+  const activeMeta = activeCarrier ? carrierMeta[activeCarrier.name] : null
 
   useEffect(() => { fetchAll() }, [])
 
@@ -571,12 +600,17 @@ export default function Logistics() {
       {/* Stats */}
       <div className="stat-grid" style={{ marginBottom: 20 }}>
         {[
-          { label: 'Active Shipments',   value: active,                      color: '#6C63FF' },
-          { label: 'Delivered',          value: delivered,                   color: '#22d3a8' },
-          { label: 'Total Spent',        value: `RM ${totalMYR.toFixed(2)}`, color: '#00D4FF' },
-          { label: 'Total Shipments',    value: shipments.length,            color: '#f59e0b' },
+          { id: 'active',         label: 'Active Shipments', value: active,                      color: '#6C63FF' },
+          { id: 'delivered',      label: 'Delivered',        value: delivered,                   color: '#22d3a8' },
+          { id: 'totalSpent',     label: 'Total Spent',      value: `RM ${totalMYR.toFixed(2)}`, color: '#00D4FF' },
+          { id: 'totalShipments', label: 'Total Shipments',  value: shipments.length,            color: '#f59e0b' },
         ].map(s => (
-          <div key={s.label} className="stat-card" style={{ '--card-glow': `${s.color}33` } as any}>
+          <div key={s.label} className="stat-card"
+            onClick={() => setModalCard(s.id)}
+            style={{ '--card-glow': `${s.color}33`, cursor: 'pointer', transition: 'box-shadow 0.25s ease, transform 0.18s ease' } as any}
+            onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = `0 0 0 1px ${s.color}99, 0 0 30px ${s.color}77, 0 0 60px ${s.color}44`; el.style.transform = 'translateY(-2px)' }}
+            onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = ''; el.style.transform = '' }}
+          >
             <div className="stat-card-label">{s.label}</div>
             <div className="stat-card-value" style={{ color: s.color }}>{loading ? '…' : s.value}</div>
           </div>
@@ -600,17 +634,25 @@ export default function Logistics() {
       {/* ── Dashboard tab ── */}
       {tab === 'dashboard' && (
         <>
-          <div className="grid-3 mb-4" style={{ marginBottom: 16 }}>
+          {/* ── Bar + Line charts ── */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
             <div className="glass-card">
               <div className="section-title">Delivery Time per Carrier (Days)</div>
               <div style={{ height: 200 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={deliveryTime}>
+                  <BarChart data={deliveryTime} barCategoryGap="35%">
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                     <XAxis dataKey="company" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                    <Tooltip {...ttStyle} />
-                    <Bar dataKey="time" name="Avg Days" fill="#00D4FF" radius={[3,3,0,0]} activeBar={{ stroke: '#fff', strokeWidth: 1, fill: '#45e3ff' }} />
+                    <Tooltip
+                      cursor={false}
+                      contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #00D4FF44', borderRadius: 12, padding: '10px 16px', boxShadow: '0 0 20px #00D4FF22' }}
+                      labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }}
+                      itemStyle={{ color: '#00D4FF', fontWeight: 600, fontSize: 12 }}
+                      formatter={(v: any) => [`${v} days`, 'Avg Delivery']}
+                    />
+                    <Bar dataKey="time" name="Avg Days" fill="#00D4FF" radius={[6,6,0,0]}
+                      activeBar={{ fill: '#00D4FF', strokeWidth: 0, filter: 'drop-shadow(0 0 8px #00D4FF) drop-shadow(0 0 18px #00D4FFAA) brightness(1.3)' }} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -624,33 +666,146 @@ export default function Logistics() {
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                     <XAxis dataKey="month" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `RM${v}`} />
-                    <Tooltip {...ttStyle} />
-                    <Line type="monotone" dataKey="cost" stroke="#f43f5e" strokeWidth={2} dot={{ r: 3 }} activeDot={{ r: 7, stroke: '#fff', strokeWidth: 1.5 }} name="Cost (RM)" />
+                    <Tooltip
+                      contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #f43f5e44', borderRadius: 12, padding: '10px 16px', boxShadow: '0 0 20px #f43f5e22' }}
+                      labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }}
+                      itemStyle={{ color: '#f43f5e', fontWeight: 600, fontSize: 12 }}
+                    />
+                    <Line type="monotone" dataKey="cost" stroke="#f43f5e" strokeWidth={2.5} dot={{ fill: '#f43f5e', r: 3 }} activeDot={{ r: 8, stroke: '#fff', strokeWidth: 2, filter: 'drop-shadow(0 0 10px #f43f5e)' }} name="Cost (RM)" />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
             </div>
+          </div>
 
-            <div className="glass-card">
-              <div className="section-title">Carrier Usage</div>
-              <div style={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie data={providerUsage} cx="50%" cy="50%" innerRadius={40} outerRadius={65} paddingAngle={4} dataKey="value">
-                      {providerUsage.map((c, i) => <Cell key={i} fill={c.color} />)}
-                    </Pie>
-                    <Tooltip {...ttStyle} />
-                  </PieChart>
-                </ResponsiveContainer>
+          {/* ── Carrier Usage — full width with side detail panel ── */}
+          <div className="glass-card" style={{ marginBottom: 16 }}>
+            <div className="section-title" style={{ marginBottom: 16 }}>Carrier Usage</div>
+            <div style={{ display: 'flex', gap: 24, alignItems: 'center' }}>
+              {/* Donut chart */}
+              <div style={{ flex: '0 0 260px' }}>
+                <PieChart width={260} height={240}>
+                  <Pie
+                    data={providerUsage}
+                    cx="50%" cy="50%"
+                    innerRadius={60} outerRadius={95}
+                    paddingAngle={4}
+                    dataKey="value"
+                    activeIndex={displayCarrierIdx ?? undefined}
+                    activeShape={GlowSlice}
+                    onMouseEnter={(_, idx) => setHoverCarrierIdx(idx)}
+                    onMouseLeave={() => setHoverCarrierIdx(null)}
+                    onClick={(_, idx) => setActiveCarrierIdx(prev => prev === idx ? null : idx)}
+                    style={{ cursor: 'pointer' }}
+                  >
+                    {providerUsage.map((c, i) => (
+                      <Cell
+                        key={i}
+                        fill={c.color}
+                        opacity={displayCarrierIdx === null || displayCarrierIdx === i ? 1 : 0.3}
+                        style={{ transition: 'opacity 0.2s ease' }}
+                      />
+                    ))}
+                  </Pie>
+                  <Tooltip
+                    cursor={false}
+                    contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10, padding: '8px 14px' }}
+                    labelStyle={{ display: 'none' }}
+                    itemStyle={{ color: '#fff' }}
+                    wrapperStyle={{ outline: 'none' }}
+                    formatter={(v: any, _: any, props: any) => {
+                      const c = props?.payload?.color ?? '#fff'
+                      return [<span style={{ color: c, fontWeight: 700 }}>{v}%</span>, <span style={{ color: '#fff', fontWeight: 600 }}>{props?.payload?.name}</span>]
+                    }}
+                  />
+                </PieChart>
+
+                {/* Legend dots */}
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', justifyContent: 'center' }}>
+                  {providerUsage.map((p, i) => (
+                    <div
+                      key={p.name}
+                      onClick={() => setActiveCarrierIdx(prev => prev === i ? null : i)}
+                      onMouseEnter={() => setHoverCarrierIdx(i)}
+                      onMouseLeave={() => setHoverCarrierIdx(null)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer',
+                        opacity: displayCarrierIdx === null || displayCarrierIdx === i ? 1 : 0.4,
+                        transition: 'opacity 0.2s ease' }}
+                    >
+                      <div style={{ width: 9, height: 9, borderRadius: 3, background: p.color,
+                        boxShadow: displayCarrierIdx === i ? `0 0 8px ${p.color}` : 'none',
+                        transition: 'box-shadow 0.2s ease' }} />
+                      <span style={{ color: displayCarrierIdx === i ? '#fff' : 'var(--clr-text-muted)', fontWeight: displayCarrierIdx === i ? 700 : 400 }}>{p.name}</span>
+                      <span style={{ color: p.color, fontWeight: 700 }}>{p.value}%</span>
+                    </div>
+                  ))}
+                </div>
               </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 12px', justifyContent: 'center', marginTop: 10 }}>
-                {providerUsage.map(p => (
-                  <div key={p.name} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-                    <div style={{ width: 8, height: 8, borderRadius: 2, background: p.color }} />
-                    <span style={{ color: 'var(--clr-text-muted)' }}>{p.name}</span>
-                    <span style={{ fontWeight: 600 }}>{p.value}%</span>
+
+              {/* Divider */}
+              <div style={{ width: 1, alignSelf: 'stretch', background: 'rgba(255,255,255,0.07)', flexShrink: 0 }} />
+
+              {/* Detail panel */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {activeCarrier && activeMeta ? (
+                  <div style={{ animation: 'pageIn 0.2s ease-out' }}>
+                    {/* Header */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+                      <div style={{ width: 14, height: 14, borderRadius: 4, background: activeCarrier.color, flexShrink: 0,
+                        boxShadow: `0 0 10px ${activeCarrier.color}, 0 0 20px ${activeCarrier.color}88` }} />
+                      <h3 style={{ fontSize: 22, fontWeight: 800, color: activeCarrier.color, margin: 0 }}>{activeCarrier.name}</h3>
+                      <span style={{ fontSize: 12, padding: '3px 10px', borderRadius: 20, background: `${activeCarrier.color}22`, color: activeCarrier.color, border: `1px solid ${activeCarrier.color}44`, fontWeight: 600 }}>
+                        {activeMeta.tier}
+                      </span>
+                    </div>
+
+                    {/* Usage bar */}
+                    <div style={{ marginBottom: 18 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                        <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.45)' }}>Usage Share</span>
+                        <span style={{ fontSize: 14, fontWeight: 800, color: activeCarrier.color }}>{activeCarrier.value}%</span>
+                      </div>
+                      <div style={{ height: 10, background: 'rgba(255,255,255,0.06)', borderRadius: 6, overflow: 'hidden' }}>
+                        <div style={{ width: `${activeCarrier.value}%`, height: '100%', background: activeCarrier.color, borderRadius: 6,
+                          boxShadow: `0 0 10px ${activeCarrier.color}99`, transition: 'width 0.4s ease' }} />
+                      </div>
+                    </div>
+
+                    {/* Stats grid */}
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
+                      {[
+                        { label: 'Avg Delivery',  value: `${activeMeta.avgDays} days`, color: activeCarrier.color },
+                        { label: 'Reliability',   value: activeMeta.reliability,        color: '#22d3a8' },
+                        { label: 'Coverage',      value: activeMeta.coverage,           color: '#00D4FF' },
+                        { label: 'Avg Cost',      value: activeMeta.avgCost,            color: '#f59e0b' },
+                      ].map(s => (
+                        <div key={s.label} style={{ padding: '12px 14px', borderRadius: 10,
+                          background: `${s.color}09`, border: `1px solid ${s.color}22` }}>
+                          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginBottom: 5 }}>{s.label}</div>
+                          <div style={{ fontSize: 15, fontWeight: 800, color: s.color }}>{s.value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Strength note */}
+                    <div style={{ padding: '12px 16px', borderRadius: 10,
+                      background: `${activeCarrier.color}0d`, border: `1px solid ${activeCarrier.color}33` }}>
+                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>Best for</div>
+                      <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.8)', lineHeight: 1.5 }}>{activeMeta.strength}</div>
+                    </div>
                   </div>
-                ))}
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                    height: '100%', gap: 12, padding: '20px 0' }}>
+                    <div style={{ width: 48, height: 48, borderRadius: 14, background: 'rgba(255,255,255,0.04)',
+                      border: '1px dashed rgba(255,255,255,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Truck size={22} color="rgba(255,255,255,0.2)" />
+                    </div>
+                    <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.3)', textAlign: 'center', maxWidth: 200 }}>
+                      Hover or click a segment to see carrier details
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -726,6 +881,165 @@ export default function Logistics() {
             </table>
           )}
         </div>
+      )}
+
+      {/* ── Stat Card Detail Modals ──────────────────────────────── */}
+      {modalCard && createPortal(
+        <div className="modal-backdrop" onClick={() => setModalCard(null)}>
+          <div className="modal-panel" style={{ maxWidth: 680, maxHeight: '88vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+            {(() => {
+              const colors: Record<string, string> = { active: '#6C63FF', delivered: '#22d3a8', totalSpent: '#00D4FF', totalShipments: '#f59e0b' }
+              const titles: Record<string, string> = { active: 'Active Shipments', delivered: 'Delivered Shipments', totalSpent: 'Shipping Cost Analysis', totalShipments: 'All Shipments' }
+              const mc = colors[modalCard] || '#6C63FF'
+              const activeList    = shipments.filter(s => s.status_code < 700)
+              const deliveredList = shipments.filter(s => s.status_code >= 700 && s.status_code < 800)
+              return (
+                <>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <div style={{ width: 10, height: 10, borderRadius: '50%', background: mc, boxShadow: `0 0 10px ${mc}` }} />
+                      <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>{titles[modalCard]}</h2>
+                    </div>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setModalCard(null)}><X size={16} /></button>
+                  </div>
+
+                  {/* active shipments */}
+                  {modalCard === 'active' && (
+                    activeList.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>
+                        <CheckCircle size={32} style={{ color: '#22d3a8', display: 'block', margin: '0 auto 12px' }} />
+                        <p>No active shipments — all deliveries completed!</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 12 }}>{activeList.length} shipment{activeList.length !== 1 ? 's' : ''} currently in transit</p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 430, overflowY: 'auto' }}>
+                          {activeList.map(s => (
+                            <div key={s.id} style={{ padding: '12px 14px', borderRadius: 10, background: 'rgba(108,99,255,0.05)', border: '1px solid rgba(108,99,255,0.18)' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                                <span style={{ fontWeight: 600, color: '#a89dff', fontSize: 12, fontFamily: 'monospace' }}>{s.tracking_no || s.id.slice(0,8)}</span>
+                                <span className={`badge ${statusBadge(s.status_code)}`}>{statusLabel(s.status_code)}</span>
+                              </div>
+                              <p style={{ fontSize: 13, fontWeight: 500 }}>{s.recipient_name} — {s.recipient_city}, {s.recipient_state}</p>
+                              <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>{s.carrier || s.service_name || '—'} · RM {Number(s.price || 0).toFixed(2)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  )}
+
+                  {/* delivered shipments */}
+                  {modalCard === 'delivered' && (
+                    deliveredList.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>
+                        <Package size={32} style={{ display: 'block', margin: '0 auto 12px', opacity: 0.25 }} />
+                        <p>No delivered shipments yet.</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                          {[
+                            { label: 'Delivered', value: deliveredList.length.toString(), color: '#22d3a8' },
+                            { label: 'Total Value', value: `RM ${deliveredList.reduce((a, s) => a + (Number(s.price) || 0), 0).toFixed(2)}`, color: '#00D4FF' },
+                          ].map(s => (
+                            <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22` }}>
+                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
+                              <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 380, overflowY: 'auto' }}>
+                          {deliveredList.map(s => (
+                            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(34,211,168,0.05)', border: '1px solid rgba(34,211,168,0.15)' }}>
+                              <CheckCircle size={14} color="#22d3a8" style={{ flexShrink: 0 }} />
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.recipient_name}</p>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{s.carrier || '—'} · {s.recipient_city}</p>
+                              </div>
+                              <span style={{ fontSize: 13, fontWeight: 700, color: '#22d3a8', flexShrink: 0 }}>RM {Number(s.price || 0).toFixed(2)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  )}
+
+                  {/* totalSpent */}
+                  {modalCard === 'totalSpent' && (
+                    <div>
+                      <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                        {[
+                          { label: 'Total Spent', value: `RM ${totalMYR.toFixed(2)}`, color: '#00D4FF' },
+                          { label: 'Avg per Shipment', value: shipments.length ? `RM ${(totalMYR / shipments.length).toFixed(2)}` : 'RM 0', color: '#6C63FF' },
+                          { label: 'Shipments', value: shipments.length.toString(), color: '#f59e0b' },
+                        ].map(s => (
+                          <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22` }}>
+                            <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
+                            <div style={{ fontSize: 15, fontWeight: 800, color: s.color }}>{s.value}</div>
+                          </div>
+                        ))}
+                      </div>
+                      <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 8 }}>6-month shipping cost trend</p>
+                      <div style={{ height: 200 }}>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={shippingCost}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                            <XAxis dataKey="month" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
+                            <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `RM${v}`} />
+                            <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10 }} />
+                            <Line type="monotone" dataKey="cost" stroke="#00D4FF" strokeWidth={2.5} dot={{ fill: '#00D4FF', r: 4 }} activeDot={{ r: 8, stroke: '#fff', strokeWidth: 2, filter: 'drop-shadow(0 0 10px #00D4FF)' }} name="Cost (RM)" />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <p style={{ fontSize: 12, color: 'var(--clr-text-muted)', marginTop: 12 }}>Carrier breakdown by cost: DHL avg RM 20–50 · J&T avg RM 8–15 · Pos Laju avg RM 7–12</p>
+                    </div>
+                  )}
+
+                  {/* totalShipments */}
+                  {modalCard === 'totalShipments' && (
+                    shipments.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>
+                        <Truck size={32} style={{ display: 'block', margin: '0 auto 12px', opacity: 0.2 }} />
+                        <p>No shipments booked yet.</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                          {[
+                            { label: 'Total', value: shipments.length.toString(), color: '#f59e0b' },
+                            { label: 'In Transit', value: activeList.length.toString(), color: '#6C63FF' },
+                            { label: 'Delivered', value: deliveredList.length.toString(), color: '#22d3a8' },
+                          ].map(s => (
+                            <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22` }}>
+                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
+                              <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 7, maxHeight: 380, overflowY: 'auto' }}>
+                          {shipments.map(s => (
+                            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.recipient_name}</p>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{s.carrier || '—'} · {s.recipient_city}, {s.recipient_state}</p>
+                              </div>
+                              <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                                <p style={{ fontSize: 13, fontWeight: 700, color: '#22d3a8' }}>RM {Number(s.price || 0).toFixed(2)}</p>
+                                <span className={`badge ${statusBadge(s.status_code)}`} style={{ fontSize: 10 }}>{statusLabel(s.status_code)}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  )}
+                </>
+              )
+            })()}
+          </div>
+        </div>,
+        document.body
       )}
 
       {showNew && (

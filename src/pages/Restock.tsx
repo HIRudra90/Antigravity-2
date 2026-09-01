@@ -1,18 +1,14 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
-import emailjs from '@emailjs/browser'
 import { supabase } from '../lib/supabaseClient'
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts'
+import { sendOrderEmail } from '../lib/restock'
+import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Cell } from 'recharts'
 import {
-  RefreshCw, AlertTriangle, CheckCircle, Clock, Zap,
+  RefreshCw, AlertTriangle, CheckCircle, Clock,
   Building2, Mail, Phone, MapPin, Plus, X, Pencil, Trash2,
   Package, ChevronDown, ChevronUp, Search, ShoppingCart, History,
   Send, FileText, Users, Activity
 } from 'lucide-react'
-
-const EJS_SERVICE  = import.meta.env.VITE_EMAILJS_SERVICE_ID  as string
-const EJS_TEMPLATE = import.meta.env.VITE_EMAILJS_TEMPLATE_ID as string
-const EJS_KEY      = import.meta.env.VITE_EMAILJS_PUBLIC_KEY  as string
 
 // ─── Types ───────────────────────────────────────────────────────
 interface Vendor {
@@ -59,44 +55,8 @@ const orderStatusColor: Record<string, string> = {
   Delivered: '#22d3a8', Cancelled: '#f43f5e',
 }
 
-// ─── Email sending via EmailJS ────────────────────────────────────
-async function sendOrderEmail(
-  vendor: Vendor, items: OrderItem[], notes: string, expectedDelivery: string
-): Promise<void> {
-  const orderNum = `ORD-${Date.now().toString().slice(-6)}`
-  const orderDate = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
-  const total = items.reduce((s, i) => s + i.quantity * i.unit_cost, 0)
-
-  console.log('[EmailJS] Sending to:', vendor.email, '| Service:', EJS_SERVICE, '| Template:', EJS_TEMPLATE)
-
-  await emailjs.send(
-    EJS_SERVICE,
-    EJS_TEMPLATE,
-    {
-      email:             vendor.email ?? '',
-      to_email:          vendor.email ?? '',
-      to_name:           vendor.name,
-      company_name:      vendor.company,
-      order_id:          orderNum,
-      order_date:        orderDate,
-      category:          vendor.category,
-      payment_terms:     vendor.payment_terms,
-      expected_delivery: expectedDelivery
-        ? new Date(expectedDelivery).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
-        : 'To be confirmed',
-      notes:             notes || '',
-      order_total:       total.toFixed(2),
-      orders: items.map(item => ({
-        name:       item.product_name,
-        sku:        item.sku || 'N/A',
-        units:      item.quantity,
-        unit_price: Number(item.unit_cost).toFixed(2),
-        price:      (item.quantity * item.unit_cost).toFixed(2),
-      })),
-    },
-    EJS_KEY
-  )
-}
+// Email sending lives in ../lib/restock so this page and the dashboard's
+// quick-restock button send byte-identical purchase orders.
 
 // Plain-text preview shown inside the modal (not the real email, just for review)
 function buildEmailPreview(vendor: Vendor, items: OrderItem[], notes: string, expectedDelivery: string) {
@@ -134,14 +94,14 @@ function DRow({ icon: Icon, label, value, color }: { icon: any; label: string; v
 }
 
 // ─── VendorFormModal ──────────────────────────────────────────────
-function VendorFormModal({ mode, vendor, onClose, onSaved }: { mode: 'add' | 'edit'; vendor?: Vendor; onClose: () => void; onSaved: () => void }) {
+function VendorFormModal({ mode, vendor, defaultCategory, onClose, onSaved }: { mode: 'add' | 'edit'; vendor?: Vendor; defaultCategory?: string; onClose: () => void; onSaved: () => void }) {
   const [form, setForm] = useState({
     name: vendor?.name ?? '',
     company: vendor?.company ?? '',
     email: vendor?.email ?? '',
     phone: vendor?.phone ?? '',
     address: vendor?.address ?? '',
-    category: vendor?.category ?? CATEGORIES[0],
+    category: vendor?.category ?? defaultCategory ?? CATEGORIES[0],
     payment_terms: vendor?.payment_terms ?? 'Net 30',
     lead_time_days: vendor?.lead_time_days ?? 7,
     status: vendor?.status ?? 'Active',
@@ -323,13 +283,13 @@ function VendorProfileModal({ vendor, orders, onClose, onEdit, onDelete, onOrder
 // ─── OrderModal ───────────────────────────────────────────────────
 function OrderModal({ vendor, prefillItem, onClose, onSaved }: {
   vendor: Vendor
-  prefillItem?: { name: string; sku: string; suggest: number }
+  prefillItem?: { name: string; sku: string; suggest: number; unitCost?: number; inventoryId?: string; currentStock?: number }
   onClose: () => void
   onSaved: () => void
 }) {
   const [items, setItems] = useState<OrderItem[]>(
     prefillItem
-      ? [{ product_name: prefillItem.name, sku: prefillItem.sku, quantity: prefillItem.suggest, unit_cost: 0 }]
+      ? [{ product_name: prefillItem.name, sku: prefillItem.sku, quantity: prefillItem.suggest, unit_cost: prefillItem.unitCost ?? 0 }]
       : [{ product_name: '', sku: '', quantity: 1, unit_cost: 0 }]
   )
   const [notes, setNotes] = useState('')
@@ -362,7 +322,19 @@ function OrderModal({ vendor, prefillItem, onClose, onSaved }: {
       vendor_id: vendor.id, vendor_name: vendor.company, vendor_email: vendor.email,
       items: validItems, total_cost: total, status, notes: notes || null,
       expected_delivery: expectedDelivery || null,
+      // Payment happens on delivery, not at order time — paid_at stays null
+      // until the order is confirmed delivered.
     })
+
+    // Update inventory immediately so this item leaves the restock queue
+    if (prefillItem?.inventoryId) {
+      await supabase.from('inventory')
+        .update({ current_stock: (prefillItem.currentStock ?? 0) + validItems.reduce((s, i) => s + i.quantity, 0), last_updated: new Date().toISOString() })
+        .eq('id', prefillItem.inventoryId)
+    }
+
+    // Note: no separate financial_transactions write needed — Payment page reads
+    // procurement totals directly from restock_orders.total_cost to avoid double-counting.
 
     if (sendEmail) {
       try {
@@ -497,19 +469,13 @@ function OrderHistoryModal({ vendor, orders, onClose, onRefresh }: {
 }) {
   const color = catColors[vendor.category] || '#6C63FF'
 
+  // Inventory is already credited when the order is placed (so it leaves the
+  // restock queue immediately). Delivery is when payment actually happens —
+  // marking an order Delivered stamps paid_at.
   const updateStatus = async (id: string, status: string) => {
-    await supabase.from('restock_orders').update({ status }).eq('id', id)
-    // When delivered, add ordered quantities back to inventory
-    if (status === 'Delivered') {
-      const order = orders.find(o => o.id === id)
-      if (order?.items) {
-        await Promise.all(
-          order.items.map(item =>
-            supabase.rpc('increment_stock_by_name', { p_name: item.product_name, p_qty: item.quantity })
-          )
-        )
-      }
-    }
+    const updates: any = { status }
+    if (status === 'Delivered') updates.paid_at = new Date().toISOString()
+    await supabase.from('restock_orders').update(updates).eq('id', id)
     onRefresh()
   }
 
@@ -633,16 +599,78 @@ function VendorCard({ vendor, onView, onEdit, onOrder }: { vendor: Vendor; onVie
   )
 }
 
+// ─── VendorPickerModal ────────────────────────────────────────────
+function VendorPickerModal({ item, onPick, onClose }: {
+  item: any & { matchingVendors: Vendor[]; prefillItem: any }
+  onPick: (vendor: Vendor) => void
+  onClose: () => void
+}) {
+  return createPortal(
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-panel" style={{ maxWidth: 480, maxHeight: '80vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <div>
+            <h2 style={{ margin: 0, fontSize: 17 }}>Select Vendor</h2>
+            <p style={{ margin: '4px 0 0', fontSize: 12, color: 'var(--clr-text-muted)' }}>
+              {item.matchingVendors.length} active vendors supply <strong style={{ color: '#fff' }}>{item.supplier}</strong>
+            </p>
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div style={{ background: 'rgba(255,255,255,0.03)', borderRadius: 10, padding: '10px 14px', marginBottom: 16, fontSize: 13, border: '1px solid rgba(255,255,255,0.08)' }}>
+          <span style={{ color: 'var(--clr-text-muted)' }}>Ordering:</span>{' '}
+          <strong>{item.prefillItem.name}</strong>{' '}
+          <span style={{ color: '#00D4FF' }}>×{item.prefillItem.suggest} units</span>
+          {item.prefillItem.unitCost > 0 && (
+            <span style={{ color: '#22d3a8', marginLeft: 8 }}>
+              ≈ ${(item.prefillItem.suggest * item.prefillItem.unitCost).toFixed(2)} total
+            </span>
+          )}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {[...item.matchingVendors]
+            .sort((a: Vendor, b: Vendor) => a.lead_time_days - b.lead_time_days)
+            .map((v: Vendor) => {
+              const color = catColors[v.category] || '#6C63FF'
+              const initials = v.company.split(' ').map((w: string) => w[0]).join('').slice(0, 2).toUpperCase()
+              return (
+                <button key={v.id} onClick={() => onPick(v)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 16px', background: 'rgba(255,255,255,0.03)', border: `1px solid ${color}22`, borderRadius: 12, cursor: 'pointer', textAlign: 'left', transition: 'border-color 0.2s, background 0.2s', width: '100%' }}
+                  onMouseEnter={e => { (e.currentTarget as HTMLElement).style.borderColor = `${color}66`; (e.currentTarget as HTMLElement).style.background = `${color}0d` }}
+                  onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = `${color}22`; (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.03)' }}>
+                  <div style={{ width: 44, height: 44, borderRadius: 10, background: `linear-gradient(135deg, ${color}, ${color}77)`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 15, fontWeight: 800, color: '#fff', flexShrink: 0 }}>
+                    {initials}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>{v.company}</div>
+                    <div style={{ fontSize: 12, color: 'var(--clr-text-muted)', marginTop: 2 }}>{v.name}</div>
+                    <div style={{ display: 'flex', gap: 10, marginTop: 6, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 11, color: '#22d3a8', fontWeight: 600 }}>⏱ {v.lead_time_days}d lead</span>
+                      <span style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{v.payment_terms}</span>
+                      {v.email ? <span style={{ fontSize: 11, color: '#6C63FF' }}>✉ email ready</span> : <span style={{ fontSize: 11, color: '#f43f5e' }}>✕ no email</span>}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 13, color, fontWeight: 700, flexShrink: 0 }}>Select →</div>
+                </button>
+              )
+            })}
+        </div>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
 // ─── Main Component ───────────────────────────────────────────────
 export default function Restock() {
   const [tab, setTab] = useState<'queue' | 'vendors'>('queue')
 
   // Queue state
-  const [autoMode, setAutoMode] = useState(true)
   const [processing, setProcessing] = useState<string | null>(null)
   const [restockQueue, setRestockQueue] = useState<any[]>([])
   const [trendData, setTrendData] = useState<any[]>([])
   const [stats, setStats] = useState({ pending: 0, critical: 0, autoApproved: 0, avgTime: '—' })
+  const [modalCard, setModalCard] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
   // Vendor state
@@ -654,12 +682,13 @@ export default function Restock() {
   const [expandedCats, setExpandedCats] = useState<Set<string>>(new Set())
 
   // Modal state
-  const [showAddVendor, setShowAddVendor] = useState(false)
+  const [showAddVendor, setShowAddVendor] = useState<string | false>(false)
   const [editingVendor, setEditingVendor] = useState<Vendor | null>(null)
   const [profileVendor, setProfileVendor] = useState<Vendor | null>(null)
-  const [orderModal, setOrderModal] = useState<{ vendor: Vendor; prefillItem?: any } | null>(null)
+  const [orderModal, setOrderModal] = useState<{ vendor: Vendor; prefillItem?: any; queueSku?: string; queuePriority?: string } | null>(null)
   const [historyVendor, setHistoryVendor] = useState<Vendor | null>(null)
   const [noVendorMsg, setNoVendorMsg] = useState('')
+  const [vendorPickerItem, setVendorPickerItem] = useState<any | null>(null)
 
   useEffect(() => { fetchData(); fetchVendors(); fetchFamilies() }, [])
 
@@ -677,7 +706,7 @@ export default function Restock() {
     try {
     const { data: invData } = await supabase
       .from('inventory')
-      .select('id, product_id, current_stock, reorder_level, products(id, name, family, supplier_lead_time_days)')
+      .select('id, product_id, current_stock, reorder_level, products(id, name, family, unit_price, supplier_lead_time_days)')
       .order('current_stock')
 
     const twoWeeksAgo = new Date(); twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 13)
@@ -704,6 +733,7 @@ export default function Restock() {
           eta: `${p?.supplier_lead_time_days ?? 3} days`,
           priority,
           inventoryId: item.id,
+          unitCost: p?.unit_price ? parseFloat(p.unit_price) * 0.6 : 0,
         }
       })
       const avgLead = queue.length
@@ -723,7 +753,6 @@ export default function Restock() {
       salesData.forEach((row: any) => { dayMap[row.sale_date] = (dayMap[row.sale_date] || 0) + row.quantity_sold })
       const trend = Object.entries(dayMap).sort().map(([, qty], i) => ({
         day: `Day ${i + 1}`, consumption: qty,
-        forecast: Math.round(qty * (0.88 + Math.random() * 0.24)),
       }))
       setTrendData(trend)
     }
@@ -750,26 +779,38 @@ export default function Restock() {
     }
   }
 
-  const handleApprove = async (item: any) => {
-    setProcessing(item.sku)
-    // Add suggested restock qty to current stock (additive, not overwrite)
-    await supabase.from('inventory')
-      .update({ current_stock: item.current + item.suggest, last_updated: new Date().toISOString() })
-      .eq('id', item.inventoryId)
-    await new Promise(r => setTimeout(r, 900))
-    setRestockQueue(prev => prev.filter(i => i.sku !== item.sku))
-    setStats(prev => ({ ...prev, pending: prev.pending - 1, critical: item.priority === 'Critical' ? prev.critical - 1 : prev.critical }))
-    setProcessing(null)
+  const norm = (s: string) => (s || '').trim().toUpperCase()
+
+  const findVendorsForItem = (item: any): Vendor[] =>
+    vendors.filter(v => norm(v.category) === norm(item.supplier) && v.status === 'Active')
+
+  const openOrderForItem = (item: any, matchingVendors: Vendor[]) => {
+    const pi = { name: item.name, sku: item.sku, suggest: item.suggest, unitCost: item.unitCost, inventoryId: item.inventoryId, currentStock: item.current }
+    if (matchingVendors.length === 1) {
+      setOrderModal({ vendor: matchingVendors[0], prefillItem: pi, queueSku: item.sku, queuePriority: item.priority })
+    } else {
+      setVendorPickerItem({ ...item, matchingVendors, prefillItem: pi })
+    }
+  }
+
+  const handleApprove = (item: any) => {
+    const matching = findVendorsForItem(item)
+    if (matching.length === 0) {
+      setNoVendorMsg(`No active vendor for "${item.supplier}". Add one in Vendor Directory, then try again.`)
+      setTimeout(() => setNoVendorMsg(''), 6000)
+      return
+    }
+    openOrderForItem(item, matching)
   }
 
   const handleQueueOrder = (item: any) => {
-    const vendor = vendors.find(v => v.category === item.supplier && v.status === 'Active')
-    if (!vendor) {
-      setNoVendorMsg(`No active vendor found for "${item.supplier}". Add one in the Vendor Directory tab.`)
-      setTimeout(() => setNoVendorMsg(''), 4000)
+    const matching = findVendorsForItem(item)
+    if (matching.length === 0) {
+      setNoVendorMsg(`No active vendor for "${item.supplier}". Go to Vendor Directory and add one.`)
+      setTimeout(() => setNoVendorMsg(''), 6000)
       return
     }
-    setOrderModal({ vendor, prefillItem: { name: item.name, sku: item.sku, suggest: item.suggest } })
+    openOrderForItem(item, matching)
   }
 
   const handleDeleteVendor = async (id: string) => {
@@ -841,12 +882,17 @@ export default function Restock() {
         <>
           <div className="stat-grid">
             {[
-              { label: 'Pending Reorders',   value: stats.pending.toString(),      color: '#f59e0b', icon: Clock },
-              { label: 'Critical Stockouts', value: stats.critical.toString(),     color: '#f43f5e', icon: AlertTriangle },
-              { label: 'Medium Priority',    value: stats.autoApproved.toString(), color: '#22d3a8', icon: CheckCircle },
-              { label: 'Avg. Lead Time',     value: stats.avgTime,                 color: '#6C63FF', icon: RefreshCw },
+              { id: 'pending',   label: 'Pending Reorders',   value: stats.pending.toString(),      color: '#f59e0b', icon: Clock },
+              { id: 'critical',  label: 'Critical Stockouts', value: stats.critical.toString(),     color: '#f43f5e', icon: AlertTriangle },
+              { id: 'medium',    label: 'Medium Priority',    value: stats.autoApproved.toString(), color: '#22d3a8', icon: CheckCircle },
+              { id: 'avgTime',   label: 'Avg. Lead Time',     value: stats.avgTime,                 color: '#6C63FF', icon: RefreshCw },
             ].map(s => (
-              <div key={s.label} className="stat-card" style={{ '--card-glow': `${s.color}33` } as any}>
+              <div key={s.label} className="stat-card"
+                onClick={() => setModalCard(s.id)}
+                style={{ '--card-glow': `${s.color}33`, cursor: 'pointer', transition: 'box-shadow 0.25s ease, transform 0.18s ease' } as any}
+                onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = `0 0 0 1px ${s.color}99, 0 0 30px ${s.color}77, 0 0 60px ${s.color}44`; el.style.transform = 'translateY(-2px)' }}
+                onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = ''; el.style.transform = '' }}
+              >
                 <div className="stat-card-icon"><s.icon size={18} color={s.color} /></div>
                 <div className="stat-card-label">{s.label}</div>
                 <div className="stat-card-value">{loading ? '…' : s.value}</div>
@@ -858,15 +904,6 @@ export default function Restock() {
             <div className="glass-card">
               <div className="flex items-center justify-between mb-4">
                 <div className="section-title" style={{ margin: 0 }}>Live Restock Queue</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <span style={{ fontSize: 13, color: 'var(--clr-text-muted)' }}>Auto-Mode</span>
-                  <button onClick={() => setAutoMode(v => !v)}
-                    style={{ width: 44, height: 24, borderRadius: 12, border: 'none', cursor: 'pointer', position: 'relative', background: autoMode ? 'linear-gradient(135deg,#6C63FF,#00D4FF)' : 'rgba(255,255,255,0.1)', transition: 'all 0.3s ease' }}
-                    aria-label="Toggle auto restock mode">
-                    <div style={{ position: 'absolute', top: 3, left: autoMode ? 23 : 3, width: 18, height: 18, borderRadius: '50%', background: '#fff', transition: 'left 0.3s ease', boxShadow: '0 2px 4px rgba(0,0,0,0.3)' }} />
-                  </button>
-                  <span className={`badge ${autoMode ? 'badge-success' : 'badge-accent'}`}><Zap size={10} /> {autoMode ? 'ON' : 'OFF'}</span>
-                </div>
               </div>
 
               {loading ? (
@@ -897,7 +934,7 @@ export default function Restock() {
                           <div style={{ display: 'flex', gap: 6 }}>
                             <button className={`btn btn-sm ${processing === item.sku ? 'btn-ghost' : 'btn-primary'}`}
                               onClick={() => handleApprove(item)} disabled={processing === item.sku}>
-                              {processing === item.sku ? '⏳' : autoMode ? '✓ Auto' : 'Approve'}
+                              {processing === item.sku ? '⏳' : 'Approve'}
                             </button>
                             <button className="btn btn-ghost btn-sm" title="Send vendor order email"
                               style={{ fontSize: 12, padding: '4px 8px' }} onClick={() => handleQueueOrder(item)}>
@@ -922,7 +959,6 @@ export default function Restock() {
                     <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
                     <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} />
                     <Line type="monotone" dataKey="consumption" stroke="#6C63FF" strokeWidth={2} dot={false} activeDot={{ r: 7, stroke: '#fff', strokeWidth: 1.5, filter: 'drop-shadow(0 0 10px #6C63FF)' }} name="Actual" connectNulls />
-                    <Line type="monotone" dataKey="forecast" stroke="#00D4FF" strokeWidth={2} dot={false} strokeDasharray="5 5" activeDot={{ r: 7, stroke: '#fff', strokeWidth: 1.5, filter: 'drop-shadow(0 0 10px #00D4FF)' }} name="Forecast" connectNulls />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -951,12 +987,17 @@ export default function Restock() {
           {/* Vendor stats */}
           <div className="stat-grid">
             {[
-              { label: 'Total Vendors',     value: vendorLoading ? '…' : totalVendors.toString(),    color: '#6C63FF', icon: Building2 },
-              { label: 'Active Vendors',    value: vendorLoading ? '…' : activeVendors.toString(),   color: '#22d3a8', icon: CheckCircle },
-              { label: 'Categories Covered', value: vendorLoading ? '…' : catsCovered.toString(),   color: '#00D4FF', icon: Users },
-              { label: 'Orders This Month', value: vendorLoading ? '…' : ordersThisMonth.toString(), color: '#f59e0b', icon: Activity },
+              { id: 'totalVendors',    label: 'Total Vendors',       value: vendorLoading ? '…' : totalVendors.toString(),    color: '#6C63FF', icon: Building2 },
+              { id: 'activeVendors',   label: 'Active Vendors',      value: vendorLoading ? '…' : activeVendors.toString(),   color: '#22d3a8', icon: CheckCircle },
+              { id: 'catsCovered',     label: 'Categories Covered',  value: vendorLoading ? '…' : catsCovered.toString(),     color: '#00D4FF', icon: Users },
+              { id: 'ordersThisMonth', label: 'Orders This Month',   value: vendorLoading ? '…' : ordersThisMonth.toString(), color: '#f59e0b', icon: Activity },
             ].map(s => (
-              <div key={s.label} className="stat-card" style={{ '--card-glow': `${s.color}33` } as any}>
+              <div key={s.label} className="stat-card"
+                onClick={() => setModalCard(s.id)}
+                style={{ '--card-glow': `${s.color}33`, cursor: 'pointer', transition: 'box-shadow 0.25s ease, transform 0.18s ease' } as any}
+                onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = `0 0 0 1px ${s.color}99, 0 0 30px ${s.color}77, 0 0 60px ${s.color}44`; el.style.transform = 'translateY(-2px)' }}
+                onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = ''; el.style.transform = '' }}
+              >
                 <div className="stat-card-icon"><s.icon size={18} color={s.color} /></div>
                 <div className="stat-card-label">{s.label}</div>
                 <div className="stat-card-value">{s.value}</div>
@@ -970,7 +1011,7 @@ export default function Restock() {
               <Search size={14} style={{ position: 'absolute', left: 13, top: '50%', transform: 'translateY(-50%)', color: 'var(--clr-text-muted)', pointerEvents: 'none' }} />
               <input className="glass-input" style={{ paddingLeft: 38, fontSize: 13 }} placeholder="Search vendors by name, company or category…" value={vendorSearch} onChange={e => setVendorSearch(e.target.value)} />
             </div>
-            <button className="btn btn-primary" onClick={() => setShowAddVendor(true)}><Plus size={14} /> Add Vendor</button>
+            <button className="btn btn-primary" onClick={() => setShowAddVendor('')}><Plus size={14} /> Add Vendor</button>
           </div>
 
           {/* Categories accordion */}
@@ -1005,7 +1046,7 @@ export default function Restock() {
                       <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--clr-text-muted)', fontSize: 13 }}>
                         No vendors in this category yet.{' '}
                         <button className="btn btn-ghost btn-sm" style={{ fontSize: 12 }}
-                          onClick={() => { setShowAddVendor(true) }}>
+                          onClick={() => { setShowAddVendor(cat) }}>
                           <Plus size={12} /> Add vendor
                         </button>
                       </div>
@@ -1031,15 +1072,275 @@ export default function Restock() {
               <Building2 size={48} style={{ marginBottom: 16, opacity: 0.15 }} />
               <p style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>No vendors yet</p>
               <p style={{ fontSize: 13, marginBottom: 20 }}>Add your first vendor to start placing restock orders by email.</p>
-              <button className="btn btn-primary" onClick={() => setShowAddVendor(true)}><Plus size={14} /> Add Your First Vendor</button>
+              <button className="btn btn-primary" onClick={() => setShowAddVendor('')}><Plus size={14} /> Add Your First Vendor</button>
             </div>
           )}
         </>
       )}
 
+      {/* ── Stat Card Detail Modals ──────────────────────────────── */}
+      {modalCard && createPortal(
+        <div className="modal-backdrop" onClick={() => setModalCard(null)}>
+          <div className="modal-panel" style={{ maxWidth: 700, maxHeight: '88vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+            {(() => {
+              const colors: Record<string, string> = {
+                pending: '#f59e0b', critical: '#f43f5e', medium: '#22d3a8', avgTime: '#6C63FF',
+                totalVendors: '#6C63FF', activeVendors: '#22d3a8', catsCovered: '#00D4FF', ordersThisMonth: '#f59e0b',
+              }
+              const titles: Record<string, string> = {
+                pending: 'Pending Reorders', critical: 'Critical Stockouts', medium: 'Medium Priority Items', avgTime: 'Lead Time Breakdown',
+                totalVendors: 'All Vendors', activeVendors: 'Active Vendors', catsCovered: 'Category Coverage', ordersThisMonth: 'Orders This Month',
+              }
+              const mc = colors[modalCard] || '#6C63FF'
+              const thisMonthOrders = orders.filter(o => {
+                const d = new Date(o.ordered_at), n = new Date()
+                return d.getMonth() === n.getMonth() && d.getFullYear() === n.getFullYear()
+              })
+              return (
+                <>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <div style={{ width: 10, height: 10, borderRadius: '50%', background: mc, boxShadow: `0 0 10px ${mc}` }} />
+                      <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>{titles[modalCard]}</h2>
+                    </div>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setModalCard(null)}><X size={16} /></button>
+                  </div>
+
+                  {/* Queue tab modals */}
+                  {(modalCard === 'pending' || modalCard === 'critical' || modalCard === 'medium') && (() => {
+                    const filtered = modalCard === 'critical'
+                      ? restockQueue.filter(i => i.priority === 'Critical')
+                      : modalCard === 'medium'
+                      ? restockQueue.filter(i => i.priority === 'Medium')
+                      : restockQueue
+                    return filtered.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>
+                        <CheckCircle size={32} style={{ color: '#22d3a8', display: 'block', margin: '0 auto 12px' }} />
+                        <p>No items in this category — stock levels are healthy!</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 12 }}>{filtered.length} item{filtered.length !== 1 ? 's' : ''} requiring attention</p>
+                        <div style={{ overflowX: 'auto' }}>
+                          <table className="data-table">
+                            <thead>
+                              <tr><th>SKU</th><th>Product</th><th>Category</th><th>Current</th><th>Reorder At</th><th>Suggest</th><th>ETA</th><th>Priority</th></tr>
+                            </thead>
+                            <tbody>
+                              {filtered.map(item => (
+                                <tr key={item.sku}>
+                                  <td><span style={{ color: '#a89dff', fontWeight: 600, fontSize: 11 }}>{item.sku}</span></td>
+                                  <td style={{ fontWeight: 500 }}>{item.name}</td>
+                                  <td style={{ color: 'var(--clr-text-muted)', fontSize: 12 }}>{item.supplier}</td>
+                                  <td><span style={{ color: item.current === 0 ? '#f43f5e' : '#f59e0b', fontWeight: 700 }}>{item.current}</span></td>
+                                  <td style={{ color: 'var(--clr-text-muted)', fontSize: 12 }}>{item.reorder}</td>
+                                  <td style={{ color: '#00D4FF', fontWeight: 600 }}>+{item.suggest}</td>
+                                  <td style={{ fontSize: 12 }}>{item.eta}</td>
+                                  <td><span className={`badge ${priorityBadge[item.priority]}`}>{item.priority}</span></td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* avgTime modal */}
+                  {modalCard === 'avgTime' && (() => {
+                    const groups = [
+                      { label: '1–2 days', count: restockQueue.filter(i => parseInt(i.eta) <= 2).length, color: '#22d3a8' },
+                      { label: '3–5 days', count: restockQueue.filter(i => parseInt(i.eta) > 2 && parseInt(i.eta) <= 5).length, color: '#f59e0b' },
+                      { label: '6–9 days', count: restockQueue.filter(i => parseInt(i.eta) > 5 && parseInt(i.eta) < 10).length, color: '#f43f5e' },
+                      { label: '10+ days', count: restockQueue.filter(i => parseInt(i.eta) >= 10).length, color: '#6C63FF' },
+                    ]
+                    return (
+                      <div>
+                        <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                          {[
+                            { label: 'Avg Lead Time', value: stats.avgTime, color: '#6C63FF' },
+                            { label: 'Total Items', value: restockQueue.length.toString(), color: '#f59e0b' },
+                            { label: 'Critical (0 stock)', value: restockQueue.filter(i => i.current === 0).length.toString(), color: '#f43f5e' },
+                          ].map(s => (
+                            <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22`, transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                              onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${s.color}66, 0 0 18px ${s.color}44`; e.currentTarget.style.transform = 'translateY(-2px)' }}
+                              onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                            >
+                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
+                              <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ height: 180, marginBottom: 16 }}>
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={groups}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                              <XAxis dataKey="label" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
+                              <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} />
+                              <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10 }} />
+                              <Bar dataKey="count" name="Items" radius={[4,4,0,0]}>
+                                {groups.map((g, i) => <Cell key={i} fill={g.color} />)}
+                              </Bar>
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                        <p style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>Shorter lead times mean faster stock recovery — prioritize critical suppliers.</p>
+                      </div>
+                    )
+                  })()}
+
+                  {/* totalVendors modal */}
+                  {modalCard === 'totalVendors' && (() => {
+                    const perCat = [...new Set(vendors.map(v => v.category))].map(cat => ({
+                      name: cat.length > 14 ? cat.slice(0, 14) + '…' : cat,
+                      count: vendors.filter(v => v.category === cat).length,
+                    })).sort((a, b) => b.count - a.count)
+                    return (
+                      <div>
+                        <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                          {[
+                            { label: 'Total Vendors', value: vendors.length.toString(), color: '#6C63FF' },
+                            { label: 'Active', value: vendors.filter(v => v.status === 'Active').length.toString(), color: '#22d3a8' },
+                            { label: 'Inactive', value: vendors.filter(v => v.status !== 'Active').length.toString(), color: '#f43f5e' },
+                          ].map(s => (
+                            <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22`, transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                              onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${s.color}66, 0 0 18px ${s.color}44`; e.currentTarget.style.transform = 'translateY(-2px)' }}
+                              onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                            >
+                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
+                              <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ height: 200 }}>
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={perCat} margin={{ top: 0, right: 0, bottom: 50, left: 0 }}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                              <XAxis dataKey="name" tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 9 }} angle={-35} textAnchor="end" axisLine={false} tickLine={false} interval={0} />
+                              <YAxis tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 10 }} axisLine={false} tickLine={false} />
+                              <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10 }} />
+                              <Bar dataKey="count" fill="#6C63FF" radius={[3,3,0,0]} activeBar={{ fill: '#8b84fb', filter: 'drop-shadow(0 0 6px #6C63FF)' }} />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* activeVendors modal */}
+                  {modalCard === 'activeVendors' && (() => {
+                    const actives = vendors.filter(v => v.status === 'Active')
+                    return (
+                      <div>
+                        <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 12 }}>{actives.length} active vendor{actives.length !== 1 ? 's' : ''}</p>
+                        <div style={{ overflowX: 'auto' }}>
+                          <table className="data-table">
+                            <thead><tr><th>Company</th><th>Contact</th><th>Category</th><th>Lead Time</th><th>Payment</th></tr></thead>
+                            <tbody>
+                              {actives.map(v => (
+                                <tr key={v.id}>
+                                  <td style={{ fontWeight: 600 }}>{v.company}</td>
+                                  <td style={{ color: 'var(--clr-text-muted)', fontSize: 12 }}>{v.name}</td>
+                                  <td><span style={{ fontSize: 11, padding: '2px 7px', borderRadius: 12, background: `${catColors[v.category] || '#6C63FF'}22`, color: catColors[v.category] || '#6C63FF', fontWeight: 600 }}>{v.category}</span></td>
+                                  <td style={{ fontSize: 12 }}>{v.lead_time_days}d</td>
+                                  <td style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>{v.payment_terms}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* catsCovered modal */}
+                  {modalCard === 'catsCovered' && (() => {
+                    const covered = [...new Set(vendors.map(v => v.category))].sort().map(cat => ({
+                      name: cat,
+                      total: vendors.filter(v => v.category === cat).length,
+                      active: vendors.filter(v => v.category === cat && v.status === 'Active').length,
+                      color: catColors[cat] || '#6C63FF',
+                    }))
+                    return (
+                      <div>
+                        <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 12 }}>{covered.length} categor{covered.length !== 1 ? 'ies' : 'y'} covered by vendor directory</p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 7, maxHeight: 420, overflowY: 'auto' }}>
+                          {covered.map((c, i) => (
+                            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderRadius: 10, background: `${c.color}07`, border: `1px solid ${c.color}20`, transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                              onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${c.color}66, 0 0 16px ${c.color}44`; e.currentTarget.style.transform = 'translateX(2px)' }}
+                              onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                            >
+                              <div style={{ width: 8, height: 8, borderRadius: 2, background: c.color, boxShadow: `0 0 6px ${c.color}`, flexShrink: 0 }} />
+                              <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>{c.name}</span>
+                              <span style={{ fontSize: 12, color: c.color, fontWeight: 700 }}>{c.active}</span>
+                              <span style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>active / {c.total} total</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* ordersThisMonth modal */}
+                  {modalCard === 'ordersThisMonth' && (
+                    thisMonthOrders.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>
+                        <p>No orders placed this month yet.</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                          {[
+                            { label: 'Orders', value: thisMonthOrders.length.toString(), color: '#f59e0b' },
+                            { label: 'Total Value', value: `$${thisMonthOrders.reduce((s, o) => s + Number(o.total_cost), 0).toFixed(0)}`, color: '#22d3a8' },
+                            { label: 'Delivered', value: thisMonthOrders.filter(o => o.status === 'Delivered').length.toString(), color: '#6C63FF' },
+                          ].map(s => (
+                            <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22`, transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                              onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${s.color}66, 0 0 18px ${s.color}44`; e.currentTarget.style.transform = 'translateY(-2px)' }}
+                              onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                            >
+                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
+                              <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflowY: 'auto' }}>
+                          {thisMonthOrders.map(o => {
+                            const sc = orderStatusColor[o.status] || '#6C63FF'
+                            return (
+                              <div key={o.id} style={{ padding: '12px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)', transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
+                                onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 0 1px ${sc}66, 0 0 16px ${sc}44`; e.currentTarget.style.transform = 'translateX(2px)' }}
+                                onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; e.currentTarget.style.transform = '' }}
+                              >
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                                    <span style={{ fontWeight: 600, fontSize: 12, color: '#a89dff', fontFamily: 'monospace' }}>#{o.id.slice(-8).toUpperCase()}</span>
+                                    <span style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>{o.vendor_name}</span>
+                                  </div>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                    <span style={{ fontWeight: 700, fontSize: 14, color: sc }}>${Number(o.total_cost).toFixed(2)}</span>
+                                    <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 20, background: `${sc}22`, color: sc, fontWeight: 600 }}>{o.status}</span>
+                                  </div>
+                                </div>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{o.items?.length || 0} item{(o.items?.length || 0) !== 1 ? 's' : ''} · {new Date(o.ordered_at).toLocaleDateString()}</p>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )
+                  )}
+                </>
+              )
+            })()}
+          </div>
+        </div>,
+        document.body
+      )}
+
       {/* ── Modals ────────────────────────────────────────────────── */}
-      {showAddVendor && (
-        <VendorFormModal mode="add" onClose={() => setShowAddVendor(false)} onSaved={fetchVendors} />
+      {showAddVendor !== false && (
+        <VendorFormModal mode="add" defaultCategory={showAddVendor} onClose={() => setShowAddVendor(false)} onSaved={fetchVendors} />
       )}
       {editingVendor && (
         <VendorFormModal mode="edit" vendor={editingVendor} onClose={() => setEditingVendor(null)} onSaved={() => { fetchVendors(); setProfileVendor(null) }} />
@@ -1060,7 +1361,16 @@ export default function Restock() {
           vendor={orderModal.vendor}
           prefillItem={orderModal.prefillItem}
           onClose={() => setOrderModal(null)}
-          onSaved={() => { fetchVendors(); setOrderModal(null) }}
+          onSaved={() => {
+            fetchVendors()
+            if (orderModal?.queueSku) {
+              const sku = orderModal.queueSku
+              const pri = orderModal.queuePriority
+              setRestockQueue(prev => prev.filter(i => i.sku !== sku))
+              setStats(prev => ({ ...prev, pending: Math.max(0, prev.pending - 1), critical: pri === 'Critical' ? Math.max(0, prev.critical - 1) : prev.critical }))
+            }
+            setOrderModal(null)
+          }}
         />
       )}
       {historyVendor && (
@@ -1069,6 +1379,17 @@ export default function Restock() {
           orders={orders.filter(o => o.vendor_id === historyVendor.id)}
           onClose={() => setHistoryVendor(null)}
           onRefresh={fetchVendors}
+        />
+      )}
+      {vendorPickerItem && (
+        <VendorPickerModal
+          item={vendorPickerItem}
+          onClose={() => setVendorPickerItem(null)}
+          onPick={vendor => {
+            const pi = vendorPickerItem
+            setVendorPickerItem(null)
+            setOrderModal({ vendor, prefillItem: pi.prefillItem, queueSku: pi.sku, queuePriority: pi.priority })
+          }}
         />
       )}
     </div>

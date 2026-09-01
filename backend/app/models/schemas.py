@@ -16,7 +16,48 @@ class PipelineResponse(BaseModel):
     product_name: str
     forecast_period: str
     sentiment_multiplier: float
+    sentiment_direction: str = "NEUTRAL"
     sentiment_analysis: str
+    sentiment_key_factors: List[str] = []
+    oil_price_used: float = 78.5
+    holidays_count: int = 0
     forecasted_demand: List[float]
     optimal_reorder_qty: int
+    market_context_used: str = ""
     status: str = "success"
+
+class RevenueForecastRequest(BaseModel):
+    last_actual_revenue: float = Field(0.0, description="Last month's actual revenue (for scaling)")
+    product_families: Optional[List[str]] = Field(
+        default=["GROCERY I", "BEVERAGES", "DAIRY", "PRODUCE", "FROZEN FOODS"],
+        description="Product families to aggregate forecast across"
+    )
+
+class RevenueForecastResponse(BaseModel):
+    xgboost_monthly: List[float]
+    ppo_llm_monthly: List[float]
+    sentiment_multiplier: float
+    sentiment_analysis: str
+    oil_price: float
+    seasonal_factors: List[float]
+
+class BacktestRequest(BaseModel):
+    """One holdout window whose real outcome the caller already knows."""
+    start_date: str = Field(..., description="First day of the holdout window, YYYY-MM-DD")
+    days: int = Field(30, ge=1, le=365, description="Length of the holdout window in days")
+    families: List[str] = Field(..., description="Product families to predict over")
+    oil_price: Optional[float] = Field(
+        None, description="Oil price prevailing during the window; live price if omitted"
+    )
+
+class FamilyBacktest(BaseModel):
+    family: str
+    predicted_total: float
+    predicted_daily: List[float]
+
+class BacktestResponse(BaseModel):
+    start_date: str
+    days: int
+    oil_price_used: float
+    per_family: List[FamilyBacktest]
+    predicted_grand_total: float

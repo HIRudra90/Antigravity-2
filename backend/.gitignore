@@ -1,0 +1,15 @@
+# Python bytecode — was previously committed and pushed to the HF Space
+__pycache__/
+*.pyc
+*.pyo
+
+# Local environment
+.env
+.venv/
+venv/
+
+# Prediction cache (written at runtime to the system temp dir)
+inventiq_cache/
+
+# Built at runtime by ppo_optimizer when the agent is stored unzipped
+*.repacked.zip

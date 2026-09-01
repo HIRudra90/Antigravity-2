@@ -702,5 +702,164 @@ select.glass-input option {
   from { opacity: 0; transform: scale(0.93) translateY(12px); }
   to   { opacity: 1; transform: scale(1)    translateY(0); }
 }
-. r e c h a r t s - t o o l t i p - i t e m   {   c o l o r :   # f f f f f f   ! i m p o r t a n t ;   }   . r e c h a r t s - t o o l t i p - l a b e l   {   c o l o r :   r g b a ( 2 5 5 , 2 5 5 , 2 5 5 , 0 . 7 )   ! i m p o r t a n t ;   }  
- 
+.recharts-tooltip-item { color: #ffffff !important; }
+.recharts-tooltip-label { color: rgba(255,255,255,0.7) !important; }
+
+/* Hide Spline "Built with Spline" watermark badge */
+a[href*="spline.design"],
+[class*="spline-watermark"],
+[id*="spline-watermark"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* Spline watermark — cover bottom-right of the background container */
+.spline-bg > div > div:last-child:not(canvas),
+.spline-bg a,
+.spline-bg [class*="logo"],
+.spline-bg [class*="watermark"],
+.spline-bg [class*="brand"] {
+  display: none !important;
+  visibility: hidden !important;
+}
+
+/* ============================================================
+   MOBILE / RESPONSIVE
+   ============================================================ */
+.mobile-menu-btn {
+  display: none;
+}
+.sidebar-close-btn {
+  display: none;
+}
+.mobile-nav-backdrop {
+  display: none;
+}
+
+@media (max-width: 860px) {
+  /* Hamburger toggle — fixed top-left, only exists on mobile */
+  .mobile-menu-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    top: 14px;
+    left: 14px;
+    z-index: 1200;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    border: 1px solid var(--glass-border);
+    background: rgba(10,12,25,0.92);
+    color: #fff;
+    cursor: pointer;
+  }
+
+  /* Sidebar becomes an off-canvas drawer instead of a hover-expand rail */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: var(--sidebar-w-open);
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+    z-index: 1300;
+  }
+  .sidebar.mobile-open {
+    transform: translateX(0);
+  }
+  /* Labels never get a hover state on touch — force them visible whenever the drawer is open */
+  .sidebar.mobile-open .sidebar-logo-text,
+  .sidebar.mobile-open .nav-item-label {
+    opacity: 1;
+  }
+  .sidebar-logo {
+    position: relative;
+  }
+  .sidebar-close-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: var(--clr-text-muted);
+    cursor: pointer;
+    padding: 4px;
+  }
+
+  .mobile-nav-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 1250;
+    background: rgba(0,0,0,0.55);
+  }
+
+  /* Content takes full width with room for the hamburger button */
+  .main-content {
+    padding: 20px 16px 24px;
+    padding-top: 70px;
+    width: 100%;
+  }
+
+  .page-header {
+    margin-bottom: 20px;
+  }
+  .page-header h1 {
+    font-size: 22px;
+  }
+  /* Most page headers inline-style a flex row for title + action button —
+     this fills in flex-direction (not set inline) so it's safe to override */
+  .page-header[style*="flex"] {
+    flex-direction: column;
+    align-items: flex-start !important;
+    gap: 10px;
+  }
+
+  .glass-card {
+    padding: 16px;
+    overflow-x: auto; /* safety net for any unwrapped table inside */
+  }
+
+  .stat-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .stat-card {
+    padding: 14px;
+  }
+
+  /* Two-column layouts collapse to a single stacked column */
+  .grid-21 {
+    grid-template-columns: 1fr;
+  }
+
+  .data-table {
+    font-size: 12px;
+  }
+  .data-table th, .data-table td {
+    padding: 8px 6px;
+    white-space: nowrap;
+  }
+
+  .modal-backdrop {
+    padding: 10px;
+  }
+  .modal-panel {
+    padding: 18px;
+    max-height: 92vh;
+  }
+}
+
+@media (max-width: 420px) {
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Spinner used by async buttons (login, place order) */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.9s linear infinite; }

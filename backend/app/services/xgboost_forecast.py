@@ -59,6 +59,7 @@ def forecast_demand(
     cluster: int = 1,
     onpromotion: int = 0,
     oil_price: float = 78.5,
+    start_date: datetime | None = None,
 ) -> list[float]:
     """
     Forecasts demand using the Colab-trained XGBoost model (model_xgb).
@@ -66,6 +67,10 @@ def forecast_demand(
     Feature columns match X_train from Colab exactly:
       store_nbr, family, onpromotion, city, state, type_x,
       cluster, dcoilwtico, day_of_week, month, year, is_weekend
+
+    `start_date` defaults to today. Passing a past date makes the model predict
+    a window whose real outcome is already known, which is what the backtest
+    endpoint uses to measure accuracy against recorded sales.
     """
     days_map = {"7d": 7, "30d": 30, "90d": 90, "365d": 365}
     days = days_map.get(period.lower(), 30)
@@ -80,7 +85,7 @@ def forecast_demand(
 
     if model is not None:
         try:
-            base_date = datetime.now()
+            base_date = start_date or datetime.now()
             forecast = []
 
             for step in range(days):

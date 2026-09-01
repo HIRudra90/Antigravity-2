@@ -141,7 +141,12 @@ export default function Alerts() {
           { type: 'Warning', count: warningCount, label: 'Warnings', desc: 'Low stock, Delays', color: '#f59e0b', icon: AlertTriangle },
           { type: 'Info', count: infoCount, label: 'Info Alerts', desc: 'New orders, AI insights', color: '#00D4FF', icon: Info },
         ].map(s => (
-          <div key={s.type} className="stat-card" style={{ '--card-glow': `${s.color}33` } as any} onClick={() => setFilterType(s.type === filterType ? 'All' : s.type)}>
+          <div key={s.type} className="stat-card"
+            style={{ '--card-glow': `${s.color}33`, cursor: 'pointer', transition: 'box-shadow 0.25s ease, transform 0.18s ease' } as any}
+            onClick={() => setFilterType(s.type === filterType ? 'All' : s.type)}
+            onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = `0 0 0 1px ${s.color}99, 0 0 30px ${s.color}77, 0 0 60px ${s.color}44`; el.style.transform = 'translateY(-2px)' }}
+            onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = ''; el.style.transform = '' }}
+          >
             <div className="stat-card-icon"><s.icon size={18} color={s.color} /></div>
             <div className="stat-card-label" style={{ color: s.color }}>{s.label}</div>
             <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>

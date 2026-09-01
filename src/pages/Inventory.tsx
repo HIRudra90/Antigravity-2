@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '../lib/supabaseClient'
+import { useAuth } from '../lib/auth'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
-  PieChart, Pie, Cell, LineChart, Line, ScatterChart, Scatter, ZAxis
+  PieChart, Pie, Cell, LineChart, Line, ScatterChart, Scatter, ZAxis, Sector
 } from 'recharts'
 import {
   Package, Search, Plus, AlertTriangle, Layers, ChevronDown, ChevronUp,
-  Pencil, Trash2, X, Tag, DollarSign, TrendingUp, RefreshCw, Activity
+  Pencil, Trash2, X, Tag, DollarSign, TrendingUp, RefreshCw, Activity, CheckCircle
 } from 'lucide-react'
 
 // ─── Types ────────────────────────────────────────────────────────
@@ -41,11 +42,28 @@ function familyColor(family: string, sorted: string[]) {
 
 const lbl: React.CSSProperties = { fontSize: 12, color: 'var(--clr-text-muted)', display: 'block', marginBottom: 5 }
 
+function GlowSlice(props: any) {
+  const { cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill } = props
+  return (
+    <Sector
+      cx={cx} cy={cy}
+      innerRadius={innerRadius - 4}
+      outerRadius={outerRadius + 14}
+      startAngle={startAngle}
+      endAngle={endAngle}
+      fill={fill}
+      style={{ filter: `drop-shadow(0 0 10px ${fill}) drop-shadow(0 0 22px ${fill}cc)` }}
+    />
+  )
+}
+
 // ─── ProductFormModal ─────────────────────────────────────────────
 function ProductFormModal({ mode, product, families, onClose, onSaved }: {
   mode: 'add' | 'edit'; product?: ProductView; families: string[]
   onClose: () => void; onSaved: () => void
 }) {
+  const { profile } = useAuth()
+  const ownerId = profile?.owner_id ?? null
   const [form, setForm] = useState({
     name: product?.name ?? '',
     family: product?.family ?? (families[0] ?? ''),
@@ -74,12 +92,18 @@ function ProductFormModal({ mode, product, families, onClose, onSaved }: {
       supplier_lead_time_days: parseInt(form.supplier_lead_time_days) || 3,
     }
     if (mode === 'add') {
-      const { data: np } = await supabase.from('products').insert(payload).select().single()
+      // owner_id is required by the tenancy RLS policy — without it the insert
+      // is rejected, since a row must belong to the owner creating it.
+      const { data: np } = await supabase
+        .from('products')
+        .insert({ ...payload, owner_id: ownerId })
+        .select().single()
       if (np) {
         await supabase.from('inventory').insert({
           product_id: np.id,
           current_stock: parseInt(form.current_stock) || 0,
           reorder_level: parseInt(form.reorder_level) || 20,
+          owner_id: ownerId,
         })
       }
     } else if (product) {
@@ -172,6 +196,10 @@ export default function Inventory() {
   const [stockOverTime, setStockOverTime] = useState<any[]>([])
   const [heatmapData, setHeatmapData] = useState<any[]>([])
   const [dashStats, setDashStats] = useState({ totalItems: 0, lowStock: 0, outOfStock: 0, categories: 0 })
+  const [activeCatIdx, setActiveCatIdx] = useState<number | null>(null)
+  const [hoverCatIdx, setHoverCatIdx] = useState<number | null>(null)
+  const [allProductStats, setAllProductStats] = useState<any[]>([])
+  const [modalCard, setModalCard] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
   // Catalog state
@@ -207,6 +235,7 @@ export default function Inventory() {
           reorder: inv.reorder_level ?? 20,
           category: productMap[inv.product_id]?.family || 'Unknown',
         }))
+        setAllProductStats([...productStats])
         setStockPerProduct(productStats.sort((a, b) => b.stock - a.stock).slice(0, 10))
 
         const cats: any = {}
@@ -307,6 +336,22 @@ export default function Inventory() {
     const next = new Set(prev); if (next.has(f)) next.delete(f); else next.add(f); return next
   })
 
+  // ── Category Distribution donut — detail panel metadata per category ──
+  const catTotal = categoryDist.reduce((a, c) => a + c.value, 0)
+  // Hover previews on top of whatever's pinned by a click; leaving the chart
+  // falls back to the pinned slice instead of clearing the panel.
+  const displayCatIdx = hoverCatIdx ?? activeCatIdx
+  const activeCat = displayCatIdx !== null ? categoryDist[displayCatIdx] : null
+  const activeCatPct = activeCat && catTotal > 0 ? Math.round((activeCat.value / catTotal) * 100) : 0
+  const activeCatMeta = activeCat ? (() => {
+    const items = allProductStats.filter((p: any) => p.category === activeCat.name)
+    const totalStock = items.reduce((a, p) => a + (p.stock || 0), 0)
+    const lowStock = items.filter(p => p.stock > 0 && p.stock <= p.reorder).length
+    const outOfStockN = items.filter(p => p.stock === 0).length
+    const avgStock = items.length ? Math.round(totalStock / items.length) : 0
+    return { productCount: items.length, totalStock, lowStock, outOfStock: outOfStockN, avgStock }
+  })() : null
+
   return (
     <div className="page-enter">
       <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
@@ -338,12 +383,17 @@ export default function Inventory() {
         <>
           <div className="stat-grid">
             {[
-              { label: 'Total Stocked Items', value: dashStats.totalItems.toLocaleString(), icon: Layers,       color: '#6C63FF' },
-              { label: 'Low Stock Alerts',    value: dashStats.lowStock.toString(),          icon: AlertTriangle, color: '#f59e0b' },
-              { label: 'Out of Stock',        value: dashStats.outOfStock.toString(),        icon: AlertTriangle, color: '#f43f5e' },
-              { label: 'Total Categories',    value: dashStats.categories.toString(),        icon: Package,       color: '#22d3a8' },
+              { id: 'totalItems',  label: 'Total Stocked Items', value: dashStats.totalItems.toLocaleString(), icon: Layers,       color: '#6C63FF' },
+              { id: 'lowStock',    label: 'Low Stock Alerts',    value: dashStats.lowStock.toString(),          icon: AlertTriangle, color: '#f59e0b' },
+              { id: 'outOfStock',  label: 'Out of Stock',        value: dashStats.outOfStock.toString(),        icon: AlertTriangle, color: '#f43f5e' },
+              { id: 'categories',  label: 'Total Categories',    value: dashStats.categories.toString(),        icon: Package,       color: '#22d3a8' },
             ].map(s => (
-              <div key={s.label} className="stat-card" style={{ '--card-glow': `${s.color}33` } as any}>
+              <div key={s.label} className="stat-card"
+                onClick={() => setModalCard(s.id)}
+                style={{ '--card-glow': `${s.color}33`, cursor: 'pointer', transition: 'box-shadow 0.25s ease, transform 0.18s ease' } as any}
+                onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = `0 0 0 1px ${s.color}99, 0 0 30px ${s.color}77, 0 0 60px ${s.color}44`; el.style.transform = 'translateY(-2px)' }}
+                onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = ''; el.style.transform = '' }}
+              >
                 <div className="stat-card-icon"><s.icon size={18} color={s.color} /></div>
                 <div className="stat-card-label">{s.label}</div>
                 <div className="stat-card-value">{loading ? '...' : s.value}</div>
@@ -351,41 +401,165 @@ export default function Inventory() {
             ))}
           </div>
 
-          <div className="grid-21 mb-4" style={{ marginBottom: 16 }}>
-            <div className="glass-card">
-              <div className="section-title">Stock per Product (Top Active)</div>
-              <div className="chart-wrapper-lg">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={stockPerProduct}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                    <XAxis dataKey="name" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} />
-                    <Tooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} />
-                    <Bar dataKey="stock" name="Stock Level" fill="#6C63FF" radius={[4,4,0,0]} activeBar={{ stroke: '#fff', strokeWidth: 1, fill: '#8b84fb', filter: 'drop-shadow(0px 0px 8px #6C63FF)' }} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
+          <div className="glass-card mb-4" style={{ marginBottom: 16 }}>
+            <div className="section-title">Stock per Product (Top Active)</div>
+            <div className="chart-wrapper-lg">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={stockPerProduct}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                  <XAxis dataKey="name" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} />
+                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} />
+                  <Tooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} />
+                  <Bar dataKey="stock" name="Stock Level" fill="#6C63FF" radius={[4,4,0,0]} activeBar={{ stroke: '#fff', strokeWidth: 1, fill: '#8b84fb', filter: 'drop-shadow(0px 0px 8px #6C63FF)' }} />
+                </BarChart>
+              </ResponsiveContainer>
             </div>
+          </div>
 
-            <div className="glass-card">
-              <div className="section-title">Category Distribution</div>
-              <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie data={categoryDist} cx="50%" cy="50%" innerRadius={50} outerRadius={80} paddingAngle={4} dataKey="value" activeShape={{ outerRadius: 90, stroke: 'none', filter: 'brightness(1.1) drop-shadow(0px 0px 8px rgba(255,255,255,0.4))' } as any}>
-                      {categoryDist.map((c, i) => <Cell key={i} fill={c.color} />)}
-                    </Pie>
-                    <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} />
-                  </PieChart>
-                </ResponsiveContainer>
+          {/* Category Distribution — full width with side detail panel (matches Carrier Usage / Expense Breakdown style) */}
+          <div className="glass-card mb-4" style={{ marginBottom: 16 }}>
+            <div className="section-title" style={{ marginBottom: 16 }}>Category Distribution</div>
+            <div style={{ display: 'flex', gap: 24, alignItems: 'center' }}>
+              {/* Donut chart */}
+              <div style={{ flex: '0 0 260px' }}>
+                <PieChart width={260} height={240}>
+                  <Pie
+                    data={categoryDist}
+                    cx="50%" cy="50%"
+                    innerRadius={60} outerRadius={95}
+                    paddingAngle={3}
+                    dataKey="value"
+                    activeIndex={displayCatIdx ?? undefined}
+                    activeShape={GlowSlice}
+                    onMouseEnter={(_, idx) => setHoverCatIdx(idx)}
+                    onMouseLeave={() => setHoverCatIdx(null)}
+                    onClick={(_, idx) => setActiveCatIdx(prev => prev === idx ? null : idx)}
+                    style={{ cursor: 'pointer' }}
+                  >
+                    {categoryDist.map((c, i) => (
+                      <Cell
+                        key={i}
+                        fill={c.color}
+                        opacity={displayCatIdx === null || displayCatIdx === i ? 1 : 0.3}
+                        style={{ transition: 'opacity 0.2s ease' }}
+                      />
+                    ))}
+                  </Pie>
+                  <Tooltip
+                    cursor={false}
+                    contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10, padding: '8px 14px' }}
+                    labelStyle={{ display: 'none' }}
+                    itemStyle={{ color: '#fff' }}
+                    wrapperStyle={{ outline: 'none' }}
+                    formatter={(v: any, _: any, props: any) => {
+                      const c = props?.payload?.color ?? '#fff'
+                      return [<span style={{ color: c, fontWeight: 700 }}>{v} products</span>, <span style={{ color: '#fff', fontWeight: 600 }}>{props?.payload?.name}</span>]
+                    }}
+                  />
+                </PieChart>
+
+                {/* Legend dots */}
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px 12px', justifyContent: 'center', maxHeight: 90, overflowY: 'auto' }}>
+                  {categoryDist.map((c, i) => (
+                    <div
+                      key={c.name}
+                      onClick={() => setActiveCatIdx(prev => prev === i ? null : i)}
+                      onMouseEnter={() => setHoverCatIdx(i)}
+                      onMouseLeave={() => setHoverCatIdx(null)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, cursor: 'pointer',
+                        opacity: displayCatIdx === null || displayCatIdx === i ? 1 : 0.4,
+                        transition: 'opacity 0.2s ease' }}
+                    >
+                      <div style={{ width: 8, height: 8, borderRadius: 2, background: c.color,
+                        boxShadow: displayCatIdx === i ? `0 0 8px ${c.color}` : 'none',
+                        transition: 'box-shadow 0.2s ease' }} />
+                      <span style={{ color: displayCatIdx === i ? '#fff' : 'var(--clr-text-muted)', fontWeight: displayCatIdx === i ? 700 : 400 }}>{c.name}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 16px', marginTop: 12, justifyContent: 'center' }}>
-                {categoryDist.map(c => (
-                  <div key={c.name} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-                    <div style={{ width: 8, height: 8, borderRadius: 2, background: c.color }} />
-                    <span style={{ color: 'var(--clr-text-muted)' }}>{c.name}</span>
+
+              {/* Divider */}
+              <div style={{ width: 1, alignSelf: 'stretch', background: 'rgba(255,255,255,0.07)', flexShrink: 0 }} />
+
+              {/* Detail panel */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {activeCat && activeCatMeta ? (
+                  <div style={{ animation: 'pageIn 0.2s ease-out' }}>
+                    {/* Header */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+                      <div style={{ width: 14, height: 14, borderRadius: 4, background: activeCat.color, flexShrink: 0,
+                        boxShadow: `0 0 10px ${activeCat.color}, 0 0 20px ${activeCat.color}88` }} />
+                      <h3 style={{ fontSize: 20, fontWeight: 800, color: activeCat.color, margin: 0 }}>{activeCat.name}</h3>
+                      <span style={{ fontSize: 12, padding: '3px 10px', borderRadius: 20, background: `${activeCat.color}22`, color: activeCat.color, border: `1px solid ${activeCat.color}44`, fontWeight: 600 }}>
+                        {activeCatMeta.outOfStock > 0 ? `${activeCatMeta.outOfStock} OUT OF STOCK` : activeCatMeta.lowStock > 0 ? `${activeCatMeta.lowStock} LOW STOCK` : 'HEALTHY'}
+                      </span>
+                    </div>
+
+                    {/* Share bar */}
+                    <div style={{ marginBottom: 18 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                        <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.45)' }}>Share of Catalog</span>
+                        <span style={{ fontSize: 14, fontWeight: 800, color: activeCat.color }}>{activeCatPct}%</span>
+                      </div>
+                      <div style={{ height: 10, background: 'rgba(255,255,255,0.06)', borderRadius: 6, overflow: 'hidden' }}>
+                        <div style={{ width: `${activeCatPct}%`, height: '100%', background: activeCat.color, borderRadius: 6,
+                          boxShadow: `0 0 10px ${activeCat.color}99`, transition: 'width 0.4s ease' }} />
+                      </div>
+                    </div>
+
+                    {/* Stats grid */}
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
+                      {[
+                        { label: 'Products',     value: activeCatMeta.productCount.toString(), color: activeCat.color },
+                        { label: 'Total Stock',  value: activeCatMeta.totalStock.toLocaleString(), color: '#00D4FF' },
+                        { label: 'Avg / Product', value: activeCatMeta.avgStock.toLocaleString(), color: '#a78bfa' },
+                        { label: 'Low / Out',    value: `${activeCatMeta.lowStock} / ${activeCatMeta.outOfStock}`, color: activeCatMeta.outOfStock > 0 ? '#f43f5e' : '#22d3a8' },
+                      ].map(s => (
+                        <div key={s.label} style={{ padding: '12px 14px', borderRadius: 10,
+                          background: `${s.color}09`, border: `1px solid ${s.color}22` }}>
+                          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginBottom: 5 }}>{s.label}</div>
+                          <div style={{ fontSize: 15, fontWeight: 800, color: s.color }}>{s.value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Insight note */}
+                    <div style={{ padding: '12px 16px', borderRadius: 10,
+                      background: `${activeCat.color}0d`, border: `1px solid ${activeCat.color}33` }}>
+                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>Insight</div>
+                      <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.8)', lineHeight: 1.5 }}>
+                        {activeCatMeta.outOfStock > 0
+                          ? `${activeCatMeta.outOfStock} product${activeCatMeta.outOfStock !== 1 ? 's' : ''} in ${activeCat.name} ${activeCatMeta.outOfStock !== 1 ? 'are' : 'is'} out of stock — check Restock for vendor orders.`
+                          : activeCatMeta.lowStock > 0
+                          ? `${activeCatMeta.lowStock} product${activeCatMeta.lowStock !== 1 ? 's' : ''} in ${activeCat.name} ${activeCatMeta.lowStock !== 1 ? 'are' : 'is'} below reorder level.`
+                          : `All ${activeCatMeta.productCount} product${activeCatMeta.productCount !== 1 ? 's' : ''} in ${activeCat.name} are healthily stocked.`}
+                      </div>
+                    </div>
                   </div>
-                ))}
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                    height: '100%', gap: 12, padding: '20px 0' }}>
+                    <div style={{ width: 48, height: 48, borderRadius: 14, background: 'rgba(255,255,255,0.04)',
+                      border: '1px dashed rgba(255,255,255,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Package size={22} color="rgba(255,255,255,0.2)" />
+                    </div>
+                    <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.3)', textAlign: 'center', maxWidth: 220 }}>
+                      Hover or click a slice to see category details
+                    </p>
+                    <div style={{ display: 'flex', gap: 14, marginTop: 4 }}>
+                      <div style={{ textAlign: 'center' }}>
+                        <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Categories</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: '#6C63FF' }}>{categoryDist.length}</div>
+                      </div>
+                      <div style={{ width: 1, background: 'rgba(255,255,255,0.08)' }} />
+                      <div style={{ textAlign: 'center' }}>
+                        <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Total Products</div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: '#00D4FF' }}>{catTotal}</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -441,12 +615,17 @@ export default function Inventory() {
           {/* Catalog stats */}
           <div className="stat-grid">
             {[
-              { label: 'Total Products',    value: catLoading ? '…' : totalProducts.toString(),    color: '#6C63FF', icon: Package },
-              { label: 'Categories',        value: catLoading ? '…' : totalCategories.toString(),  color: '#00D4FF', icon: Tag },
-              { label: 'Avg Margin',        value: catLoading ? '…' : `${avgMargin}%`,             color: '#22d3a8', icon: TrendingUp },
-              { label: 'Out of Stock',      value: catLoading ? '…' : outOfStock.toString(),       color: '#f43f5e', icon: AlertTriangle },
+              { id: 'totalProducts', label: 'Total Products',    value: catLoading ? '…' : totalProducts.toString(),    color: '#6C63FF', icon: Package },
+              { id: 'cats',          label: 'Categories',        value: catLoading ? '…' : totalCategories.toString(),  color: '#00D4FF', icon: Tag },
+              { id: 'avgMargin',     label: 'Avg Margin',        value: catLoading ? '…' : `${avgMargin}%`,             color: '#22d3a8', icon: TrendingUp },
+              { id: 'catOutOfStock', label: 'Out of Stock',      value: catLoading ? '…' : outOfStock.toString(),       color: '#f43f5e', icon: AlertTriangle },
             ].map(s => (
-              <div key={s.label} className="stat-card" style={{ '--card-glow': `${s.color}33` } as any}>
+              <div key={s.label} className="stat-card"
+                onClick={() => setModalCard(s.id)}
+                style={{ '--card-glow': `${s.color}33`, cursor: 'pointer', transition: 'box-shadow 0.25s ease, transform 0.18s ease' } as any}
+                onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = `0 0 0 1px ${s.color}99, 0 0 30px ${s.color}77, 0 0 60px ${s.color}44`; el.style.transform = 'translateY(-2px)' }}
+                onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = ''; el.style.transform = '' }}
+              >
                 <div className="stat-card-icon"><s.icon size={18} color={s.color} /></div>
                 <div className="stat-card-label">{s.label}</div>
                 <div className="stat-card-value">{s.value}</div>
@@ -559,6 +738,279 @@ export default function Inventory() {
             </div>
           )}
         </>
+      )}
+
+      {/* ── Stat Card Detail Modals ──────────────────────────────── */}
+      {modalCard && createPortal(
+        <div className="modal-backdrop" onClick={() => setModalCard(null)}>
+          <div className="modal-panel" style={{ maxWidth: 680, maxHeight: '88vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+            {/* Header */}
+            {(() => {
+              const colors: Record<string, string> = {
+                totalItems: '#6C63FF', lowStock: '#f59e0b', outOfStock: '#f43f5e', categories: '#22d3a8',
+                totalProducts: '#6C63FF', cats: '#00D4FF', avgMargin: '#22d3a8', catOutOfStock: '#f43f5e',
+              }
+              const titles: Record<string, string> = {
+                totalItems: 'Total Stocked Items', lowStock: 'Low Stock Alerts', outOfStock: 'Out of Stock Products',
+                categories: 'Category Distribution', totalProducts: 'Product Catalog', cats: 'Category Breakdown',
+                avgMargin: 'Margin Analysis', catOutOfStock: 'Out of Stock — Catalog',
+              }
+              const mc = colors[modalCard] || '#6C63FF'
+              const title = titles[modalCard] || ''
+              return (
+                <>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <div style={{ width: 10, height: 10, borderRadius: '50%', background: mc, boxShadow: `0 0 10px ${mc}` }} />
+                      <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>{title}</h2>
+                    </div>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setModalCard(null)}><X size={16} /></button>
+                  </div>
+
+                  {/* totalItems */}
+                  {modalCard === 'totalItems' && (
+                    <div>
+                      <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                        {[
+                          { label: 'Total Units', value: dashStats.totalItems.toLocaleString(), color: '#6C63FF' },
+                          { label: 'Products Tracked', value: allProductStats.length.toString(), color: '#00D4FF' },
+                          { label: 'Avg Stock/Product', value: allProductStats.length ? Math.round(dashStats.totalItems / allProductStats.length).toString() : '0', color: '#22d3a8' },
+                        ].map(s => (
+                          <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22` }}>
+                            <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
+                            <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
+                          </div>
+                        ))}
+                      </div>
+                      <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 8 }}>Top products by stock level</p>
+                      <div style={{ height: 220 }}>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={allProductStats.slice(0, 12)} margin={{ top: 0, right: 0, bottom: 50, left: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                            <XAxis dataKey="name" tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 9 }} angle={-35} textAnchor="end" axisLine={false} tickLine={false} interval={0} />
+                            <YAxis tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 10 }} axisLine={false} tickLine={false} />
+                            <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10 }} />
+                            <Bar dataKey="stock" fill="#6C63FF" radius={[3,3,0,0]} activeBar={{ fill: '#8b84fb', filter: 'drop-shadow(0 0 6px #6C63FF)' }} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* lowStock */}
+                  {modalCard === 'lowStock' && (() => {
+                    const items = allProductStats.filter(p => p.stock > 0 && p.stock <= p.reorder)
+                    return items.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>
+                        <CheckCircle size={32} style={{ marginBottom: 10, color: '#22d3a8', display: 'block', margin: '0 auto 12px' }} />
+                        <p>All products are above their reorder level — no low stock alerts!</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <p style={{ color: 'var(--clr-text-muted)', fontSize: 13, marginBottom: 12 }}>{items.length} product{items.length !== 1 ? 's' : ''} approaching reorder threshold</p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 420, overflowY: 'auto' }}>
+                          {items.sort((a, b) => (a.stock / a.reorder) - (b.stock / b.reorder)).map((p, i) => (
+                            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.2)' }}>
+                              <AlertTriangle size={14} color="#f59e0b" style={{ flexShrink: 0 }} />
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</p>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{p.category}</p>
+                              </div>
+                              <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                                <p style={{ fontSize: 14, fontWeight: 700, color: '#f59e0b' }}>{p.stock}</p>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>reorder at {p.reorder}</p>
+                              </div>
+                              <div style={{ width: 52, height: 5, background: 'rgba(255,255,255,0.08)', borderRadius: 3, overflow: 'hidden', flexShrink: 0 }}>
+                                <div style={{ width: `${Math.min(100, (p.stock / p.reorder) * 100)}%`, height: '100%', background: '#f59e0b', borderRadius: 3 }} />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* outOfStock */}
+                  {modalCard === 'outOfStock' && (() => {
+                    const items = allProductStats.filter(p => p.stock === 0)
+                    return items.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>
+                        <CheckCircle size={32} style={{ color: '#22d3a8', display: 'block', margin: '0 auto 12px' }} />
+                        <p>No products are currently out of stock!</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <p style={{ color: '#f43f5e', fontSize: 13, marginBottom: 12 }}>{items.length} product{items.length !== 1 ? 's' : ''} completely out of stock — immediate restocking recommended</p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 7, maxHeight: 420, overflowY: 'auto' }}>
+                          {items.map((p, i) => (
+                            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(244,63,94,0.06)', border: '1px solid rgba(244,63,94,0.2)' }}>
+                              <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#f43f5e', boxShadow: '0 0 6px #f43f5e', flexShrink: 0 }} />
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</p>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{p.category} · reorder at {p.reorder}</p>
+                              </div>
+                              <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 20, background: 'rgba(244,63,94,0.15)', color: '#f43f5e', fontWeight: 700, flexShrink: 0 }}>OUT OF STOCK</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* categories */}
+                  {modalCard === 'categories' && (
+                    <div>
+                      <div style={{ height: 180, marginBottom: 16 }}>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart>
+                            <Pie data={categoryDist} cx="50%" cy="50%" innerRadius={45} outerRadius={75} paddingAngle={4} dataKey="value">
+                              {categoryDist.map((c, i) => <Cell key={i} fill={c.color} />)}
+                            </Pie>
+                            <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10 }} />
+                          </PieChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
+                        {[...categoryDist].sort((a, b) => b.value - a.value).map((c, i) => (
+                          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, background: `${c.color}08`, border: `1px solid ${c.color}22` }}>
+                            <div style={{ width: 8, height: 8, borderRadius: 2, background: c.color, boxShadow: `0 0 6px ${c.color}` }} />
+                            <span style={{ flex: 1, fontSize: 13, fontWeight: 500 }}>{c.name}</span>
+                            <span style={{ fontSize: 14, fontWeight: 700, color: c.color }}>{c.value}</span>
+                            <span style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>products</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* totalProducts (catalog) */}
+                  {modalCard === 'totalProducts' && (() => {
+                    const perCat = allFamilies.map(f => ({
+                      name: f.length > 14 ? f.slice(0, 14) + '…' : f,
+                      count: products.filter(p => p.family === f).length,
+                    })).sort((a, b) => b.count - a.count)
+                    return (
+                      <div>
+                        <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                          {[
+                            { label: 'Total Products', value: products.length.toString(), color: '#6C63FF' },
+                            { label: 'In Stock', value: products.filter(p => p.status === 'In Stock').length.toString(), color: '#22d3a8' },
+                            { label: 'Out of Stock', value: products.filter(p => p.status === 'Out of Stock').length.toString(), color: '#f43f5e' },
+                          ].map(s => (
+                            <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22` }}>
+                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
+                              <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ height: 220 }}>
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={perCat} margin={{ top: 0, right: 0, bottom: 55, left: 0 }}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                              <XAxis dataKey="name" tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 9 }} angle={-38} textAnchor="end" axisLine={false} tickLine={false} interval={0} />
+                              <YAxis tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 10 }} axisLine={false} tickLine={false} />
+                              <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10 }} />
+                              <Bar dataKey="count" name="Products" fill="#6C63FF" radius={[3,3,0,0]} activeBar={{ fill: '#8b84fb', filter: 'drop-shadow(0 0 6px #6C63FF)' }} />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* cats (catalog) */}
+                  {modalCard === 'cats' && (() => {
+                    const catData = allFamilies.map(f => {
+                      const fp = products.filter(p => p.family === f)
+                      return { name: f, count: fp.length, oos: fp.filter(p => p.status === 'Out of Stock').length, low: fp.filter(p => p.status === 'Low Stock').length, avgMargin: fp.length ? Math.round(fp.reduce((s, p) => s + p.margin, 0) / fp.length) : 0 }
+                    }).sort((a, b) => b.count - a.count)
+                    return (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 460, overflowY: 'auto' }}>
+                        {catData.map((c, i) => (
+                          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderRadius: 10, background: 'rgba(0,212,255,0.04)', border: '1px solid rgba(0,212,255,0.12)' }}>
+                            <span style={{ flex: 1, fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name}</span>
+                            <span style={{ fontSize: 13, color: '#00D4FF', fontWeight: 700, flexShrink: 0 }}>{c.count} prods</span>
+                            {c.oos > 0 && <span style={{ fontSize: 11, padding: '2px 6px', borderRadius: 12, background: 'rgba(244,63,94,0.15)', color: '#f43f5e', fontWeight: 600, flexShrink: 0 }}>{c.oos} OOS</span>}
+                            {c.low > 0 && <span style={{ fontSize: 11, padding: '2px 6px', borderRadius: 12, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', fontWeight: 600, flexShrink: 0 }}>{c.low} Low</span>}
+                            <span style={{ fontSize: 12, fontWeight: 700, color: c.avgMargin >= 20 ? '#22d3a8' : c.avgMargin >= 10 ? '#f59e0b' : '#f43f5e', flexShrink: 0 }}>{c.avgMargin}% margin</span>
+                          </div>
+                        ))}
+                      </div>
+                    )
+                  })()}
+
+                  {/* avgMargin (catalog) */}
+                  {modalCard === 'avgMargin' && (() => {
+                    const dist = [
+                      { range: '< 10%', count: products.filter(p => p.margin < 10).length, color: '#f43f5e' },
+                      { range: '10–20%', count: products.filter(p => p.margin >= 10 && p.margin < 20).length, color: '#f59e0b' },
+                      { range: '20–30%', count: products.filter(p => p.margin >= 20 && p.margin < 30).length, color: '#22d3a8' },
+                      { range: '30%+', count: products.filter(p => p.margin >= 30).length, color: '#6C63FF' },
+                    ]
+                    const top5 = [...products].sort((a, b) => b.margin - a.margin).slice(0, 5)
+                    return (
+                      <div>
+                        <div style={{ height: 180, marginBottom: 16 }}>
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={dist}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                              <XAxis dataKey="range" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
+                              <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} />
+                              <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10 }} />
+                              <Bar dataKey="count" name="Products" radius={[4,4,0,0]}>
+                                {dist.map((d, i) => <Cell key={i} fill={d.color} />)}
+                              </Bar>
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                        <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 10 }}>Top 5 by profit margin:</p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          {top5.map((p, i) => (
+                            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, background: 'rgba(34,211,168,0.04)', border: '1px solid rgba(34,211,168,0.12)' }}>
+                              <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)', width: 20, flexShrink: 0 }}>#{i+1}</span>
+                              <span style={{ flex: 1, fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
+                              <span style={{ fontSize: 13, fontWeight: 800, color: '#22d3a8', flexShrink: 0 }}>{p.margin}%</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* catOutOfStock (catalog) */}
+                  {modalCard === 'catOutOfStock' && (() => {
+                    const oosProds = products.filter(p => p.status === 'Out of Stock')
+                    return oosProds.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>
+                        <CheckCircle size={32} style={{ color: '#22d3a8', display: 'block', margin: '0 auto 12px' }} />
+                        <p>All catalog products currently in stock!</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <p style={{ color: '#f43f5e', fontSize: 13, marginBottom: 12 }}>{oosProds.length} product{oosProds.length !== 1 ? 's' : ''} out of stock in catalog</p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 7, maxHeight: 420, overflowY: 'auto' }}>
+                          {oosProds.map((p, i) => (
+                            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(244,63,94,0.05)', border: '1px solid rgba(244,63,94,0.18)' }}>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</p>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{p.sku} · {p.family}</p>
+                              </div>
+                              <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                                <p style={{ fontSize: 13, fontWeight: 700, color: '#22d3a8' }}>${Number(p.unit_price).toFixed(2)}</p>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>Reorder at {p.reorder}</p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })()}
+                </>
+              )
+            })()}
+          </div>
+        </div>,
+        document.body
       )}
 
       {/* ── Modals ────────────────────────────────────────────────── */}

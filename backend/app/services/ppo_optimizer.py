@@ -1,22 +1,72 @@
 import os
+import tempfile
+import zipfile
 import numpy as np
 from app.config import settings
 
 _ppo_agent = None
 
+# Members Stable-Baselines3 writes into its save archive.
+_SB3_MEMBERS = ("data", "policy.pth", "policy.optimizer.pth", "pytorch_variables.pth")
+
+
+def _resolve_agent_archive() -> str | None:
+    """
+    Returns a path PPO.load can actually open.
+
+    SB3 saves a single .zip, but this repo stores the agent already unpacked
+    into a directory. PPO.load(<dir>) appends ".zip" and fails, which the
+    caller used to swallow -- so every reorder quantity came from the
+    analytical fallback while the UI reported PPO. Repack the directory into a
+    temp archive when that is the form on disk.
+    """
+    base = settings.PPO_AGENT_PATH
+
+    if os.path.isfile(base):
+        return base
+    if os.path.isfile(base + ".zip"):
+        return base + ".zip"
+
+    if os.path.isdir(base):
+        present = [m for m in _SB3_MEMBERS if os.path.isfile(os.path.join(base, m))]
+        if "data" not in present or "policy.pth" not in present:
+            print(f"PPO directory {base} is missing SB3 members (found {present}).")
+            return None
+        # Repack next to the model when writable, else into the temp dir, so
+        # the zip survives across workers instead of being rebuilt per process.
+        for target_dir in (os.path.dirname(base), tempfile.gettempdir()):
+            archive = os.path.join(target_dir, "ppo_inventory_agent.repacked.zip")
+            try:
+                if not os.path.isfile(archive):
+                    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for name in sorted(os.listdir(base)):
+                            path = os.path.join(base, name)
+                            if os.path.isfile(path):
+                                zf.write(path, arcname=name)
+                    print(f"Repacked PPO agent directory into {archive}")
+                return archive
+            except OSError as e:
+                print(f"Could not write PPO archive to {target_dir}: {e}")
+                continue
+    return None
+
+
 def load_ppo_agent():
     global _ppo_agent
     if _ppo_agent is not None:
         return _ppo_agent
-    if os.path.exists(settings.PPO_AGENT_PATH):
-        try:
-            from stable_baselines3 import PPO
-            _ppo_agent = PPO.load(settings.PPO_AGENT_PATH)
-            print(f"PPO agent loaded from {settings.PPO_AGENT_PATH}")
-        except Exception as e:
-            print(f"Failed to load PPO agent: {e}. Using analytical policy fallback.")
-    else:
+
+    archive = _resolve_agent_archive()
+    if not archive:
         print(f"PPO agent not found at {settings.PPO_AGENT_PATH}. Using analytical policy fallback.")
+        return None
+
+    try:
+        from stable_baselines3 import PPO
+        _ppo_agent = PPO.load(archive)
+        print(f"PPO agent loaded from {archive}")
+    except Exception as e:
+        print(f"Failed to load PPO agent: {e}. Using analytical policy fallback.")
     return _ppo_agent
 
 def optimize_restock(

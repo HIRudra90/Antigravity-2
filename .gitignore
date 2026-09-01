@@ -9,3 +9,8 @@ __pycache__/
 *.pyc
 .DS_Store
 .claude/
+
+.vercel
+
+# Supabase CLI scratch (link state, version cache) — not project source
+supabase/.temp/
