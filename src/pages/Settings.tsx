@@ -947,17 +947,26 @@ export default function Settings() {
                       <table className="data-table">
                         <thead>
                           <tr>
-                            <th>Day</th><th>Products sold</th><th>Units</th>
-                            <th>Revenue</th><th>Lost to stockout</th><th>Crossed reorder</th>
+                            <th>Day</th><th>Units sold</th><th>Revenue</th>
+                            <th>Delivered</th><th>Units received</th>
+                            <th>Lost to stockout</th><th>Crossed reorder</th>
                           </tr>
                         </thead>
                         <tbody>
                           {simRows.map((r: any) => (
                             <tr key={r.day}>
                               <td style={{ whiteSpace: 'nowrap' }}>{r.day}</td>
-                              <td>{r.rows_inserted}</td>
                               <td>{Number(r.units_sold).toLocaleString()}</td>
                               <td style={{ color: '#22d3a8', fontWeight: 600 }}>{locale.moneyShort(Number(r.revenue))}</td>
+                              {/* Deliveries are the half of the cycle the
+                                  simulator originally lacked: without them
+                                  stock only ever fell. */}
+                              <td style={{ color: Number(r.delivered) > 0 ? '#a78bfa' : 'var(--clr-text-muted)', fontWeight: Number(r.delivered) > 0 ? 700 : 400 }}>
+                                {r.delivered}
+                              </td>
+                              <td style={{ color: Number(r.units_received) > 0 ? '#a78bfa' : 'var(--clr-text-muted)' }}>
+                                {Number(r.units_received).toLocaleString()}
+                              </td>
                               {/* Unmet demand is the point of the exercise: it is
                                   what a reorder level set too low actually costs. */}
                               <td style={{ color: Number(r.lost_units) > 0 ? '#f43f5e' : 'var(--clr-text-muted)', fontWeight: Number(r.lost_units) > 0 ? 700 : 400 }}>
