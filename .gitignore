@@ -14,3 +14,15 @@ __pycache__/
 
 # Supabase CLI scratch (link state, version cache) — not project source
 supabase/.temp/
+
+# /brag video output — rendered MP4s, frame caches and a scaffolded
+# composition project. Keep the video locally; don't push binaries.
+brag-output/
+
+# Database rescue dumps taken before destructive migrations. These are real
+# business records (one is a 13.8 MB export of every sales row), so they stay
+# on the machine that made them rather than in the repo's permanent history.
+supabase/backups/
+
+# Vite writes this beside the config when it reloads it; regenerated per run.
+vite.config.ts.timestamp-*.mjs

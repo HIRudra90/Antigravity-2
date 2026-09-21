@@ -11,6 +11,14 @@ class PipelineRequest(BaseModel):
     market_text: Optional[str] = Field("", description="Raw market text / newsletter insights for LLM sentiment analysis")
     historical_sales: List[float] = Field(..., min_items=1, description="Historical sales values (e.g. daily or weekly sales)")
 
+class SentimentComponent(BaseModel):
+    """One scored input behind a multiplier, so the total can be audited."""
+    label: str
+    detail: str
+    contribution: float
+    score: Optional[float] = None
+    engine: Optional[str] = None
+
 class PipelineResponse(BaseModel):
     product_id: str
     product_name: str
@@ -24,7 +32,31 @@ class PipelineResponse(BaseModel):
     forecasted_demand: List[float]
     optimal_reorder_qty: int
     market_context_used: str = ""
+    sentiment_components: List[SentimentComponent] = []
+    oil_context: dict = {}
     status: str = "success"
+
+class Headline(BaseModel):
+    title: str
+    description: str = ""
+    source: str = ""
+    published_at: str = ""
+    url: str = ""
+
+class MarketInsightResponse(BaseModel):
+    """Current market conditions, decomposed into the inputs that produced them."""
+    multiplier: float
+    direction: str
+    analysis: str
+    total_adjustment: float
+    components: List[SentimentComponent]
+    oil: dict
+    holidays: List[dict]
+    headlines: List[Headline]
+    news_status: str
+    news_engine: str
+    family: str
+    generated_at: str
 
 class RevenueForecastRequest(BaseModel):
     last_actual_revenue: float = Field(0.0, description="Last month's actual revenue (for scaling)")

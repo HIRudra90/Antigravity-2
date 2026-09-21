@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '../lib/supabaseClient'
+import { useLiveData } from '../lib/useLiveData'
 import { useAuth } from '../lib/auth'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -214,9 +215,15 @@ export default function Inventory() {
   useEffect(() => { fetchInventoryData() }, [])
   useEffect(() => { if (tab === 'catalog') fetchProducts() }, [tab])
 
+  // Stock moves on every sale and every restock, so this page follows it.
+  useLiveData('inventory-live', ['inventory', 'sales_transactions', 'restock_orders'], () => {
+    fetchInventoryData({ silent: true })
+    if (tab === 'catalog') fetchProducts()
+  })
+
   // ── Dashboard data fetch ──────────────────────────────────────
-  async function fetchInventoryData() {
-    setLoading(true)
+  async function fetchInventoryData({ silent = false }: { silent?: boolean } = {}) {
+    if (!silent) setLoading(true)
     try {
       const [{ data: invRows }, { data: productRows }] = await Promise.all([
         supabase.from('inventory').select('product_id, current_stock, reorder_level'),
@@ -277,7 +284,7 @@ export default function Inventory() {
         }
       }
     } catch (err) { console.error('Error fetching inventory:', err) }
-    finally { setLoading(false) }
+    finally { if (!silent) setLoading(false) }
   }
 
   // ── Catalog data fetch ────────────────────────────────────────
@@ -354,7 +361,7 @@ export default function Inventory() {
 
   return (
     <div className="page-enter">
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div className="page-header page-header-row">
         <div>
           <h1>Inventory Dashboard</h1>
           <p>Stock levels, product catalog, and inventory analytics</p>

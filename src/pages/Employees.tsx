@@ -10,6 +10,16 @@ import {
   UploadCloud, Save, Clock
 } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
+import { useLocale } from '../lib/locale'
+import { useLiveData } from '../lib/useLiveData'
+
+/**
+ * Only Active staff are on payroll. Inactive and On Leave employees get no
+ * salary row raised, are excluded from payroll totals, and cannot be paid.
+ * Mirrors the same helper in Payment.tsx and the agent-payroll function.
+ */
+const isPayable = (e: { status?: string } | undefined) =>
+  (e?.status ?? '').trim().toLowerCase() === 'active'
 
 // ─── Types ───────────────────────────────────────────────────────
 interface Employee {
@@ -129,7 +139,28 @@ function ImageUpload({ currentUrl, onImageChange, size = 80 }: {
 }
 
 // ─── Main Component ─────────────────────────────────────────────
+// The chart detail modal always carries the whole cohort — paid, due and
+// anyone off payroll — and switches between them in-place. It used to be
+// loaded with only the slice you clicked, so the other total always read $0.
+type ChartView = 'paid' | 'due' | 'off'
+
+interface ChartRow { emp: Employee; isPaid: boolean; payable: boolean; amount: number }
+
+interface ChartModalData {
+  title: string
+  color: string
+  /** Per-view heading. Falls back to `title` for views not listed (the role modal keeps its role name). */
+  titleByView?: Partial<Record<ChartView, string>>
+  rows: ChartRow[]
+  totalPaid: number
+  totalDue: number
+  initialView: ChartView
+}
+
+const viewOf = (r: ChartRow): ChartView => !r.payable ? 'off' : r.isPaid ? 'paid' : 'due'
+
 export default function Employees() {
+  const { symbol } = useLocale()
   const [employees, setEmployees] = useState<Employee[]>([])
   const [payments, setPayments] = useState<SalaryPayment[]>([])
   const [search, setSearch] = useState('')
@@ -139,11 +170,7 @@ export default function Employees() {
   const [expandedRoles, setExpandedRoles] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
   const [statModal, setStatModal] = useState<null | 'total' | 'active' | 'paid' | 'due'>(null)
-  const [chartModal, setChartModal] = useState<null | {
-    title: string; subtitle: string; color: string
-    rows: { emp: Employee; isPaid: boolean; amount: number }[]
-    totalPaid: number; totalDue: number
-  }>(null)
+  const [chartModal, setChartModal] = useState<null | ChartModalData>(null)
 
   const now = new Date()
   const currentMonth = now.getMonth() + 1
@@ -165,10 +192,16 @@ export default function Employees() {
 
   useEffect(() => { fetchData() }, [fetchData])
 
+  // Payroll can also be moved by the Payment page and by the payroll agent.
+  useLiveData('employees-live', ['employees', 'salary_payments'], fetchData)
+
   // ─── Ensure salary records exist for current month ────────────
   const ensureSalaryRecords = useCallback(async (emps: Employee[]) => {
     const existingIds = payments.map(p => p.employee_id)
-    const missing = emps.filter(e => !existingIds.includes(e.id))
+    // Active staff only — an Inactive or On Leave employee must not have a
+    // salary row raised, otherwise they show as owing and get swept into a
+    // "pay all" run.
+    const missing = emps.filter(e => isPayable(e) && !existingIds.includes(e.id))
     if (missing.length === 0) return
 
     const records = missing.map(e => ({
@@ -189,12 +222,20 @@ export default function Employees() {
   }, [employees.length])
 
   // ─── Helpers ──────────────────────────────────────────────────
-  const getPaymentStatus = (empId: string): 'Paid' | 'Due' => {
+  const getPaymentStatus = (empId: string): 'Paid' | 'Due' | 'N/A' => {
+    const emp = employees.find(e => e.id === empId)
+    if (emp && !isPayable(emp)) return 'N/A'
     const p = payments.find(p => p.employee_id === empId)
     return p?.status === 'Paid' ? 'Paid' : 'Due'
   }
 
   const payEmployee = async (empId: string) => {
+    // Last line of defence. The UI hides the pay controls for non-Active
+    // staff, but this is the only place that actually moves money, so it
+    // refuses here too rather than trusting every caller to have checked.
+    const target = employees.find(e => e.id === empId)
+    if (target && !isPayable(target)) return
+
     const existing = payments.find(p => p.employee_id === empId)
     if (existing) {
       await supabase.from('salary_payments')
@@ -216,7 +257,12 @@ export default function Employees() {
   }
 
   const payAllEmployees = async () => {
-    const duePayments = payments.filter(p => p.status === 'Due')
+    // Active staff only, on both halves. A stale Due row left behind by someone
+    // who has since gone Inactive must not be swept up, and the backfill below
+    // must not raise a fresh Paid row for them either — that second path was
+    // paying every employee on the books regardless of status.
+    const payableSet = new Set(employees.filter(isPayable).map(e => e.id))
+    const duePayments = payments.filter(p => p.status === 'Due' && payableSet.has(p.employee_id))
     if (duePayments.length === 0) return
 
     const dueIds = duePayments.map(p => p.id)
@@ -225,7 +271,7 @@ export default function Employees() {
       .in('id', dueIds)
 
     const paidEmployeeIds = payments.map(p => p.employee_id)
-    const unpaidEmps = employees.filter(e => !paidEmployeeIds.includes(e.id))
+    const unpaidEmps = employees.filter(e => isPayable(e) && !paidEmployeeIds.includes(e.id))
     if (unpaidEmps.length > 0) {
       await supabase.from('salary_payments').insert(
         unpaidEmps.map(e => ({
@@ -255,13 +301,19 @@ export default function Employees() {
   }
 
   // ─── Stats ────────────────────────────────────────────────────
+  // Payroll figures count Active staff only. Totals used to include every
+  // employee and every salary row, so Inactive and On Leave people inflated
+  // both the monthly payroll and the "paid this month" figure.
   const totalEmployees = employees.length
-  const activeCount = employees.filter(e => e.status === 'Active').length
-  const totalSalary = employees.reduce((s, e) => s + Number(e.monthly_salary), 0)
-  const paidCount = payments.filter(p => p.status === 'Paid').length
-  const dueCount = totalEmployees - paidCount
-  const paidAmount = payments.filter(p => p.status === 'Paid').reduce((s, p) => s + Number(p.amount), 0)
-  const dueAmount = totalSalary - paidAmount
+  const activeCount = employees.filter(isPayable).length
+  const payableIds = new Set(employees.filter(isPayable).map(e => e.id))
+  const payrollRows = payments.filter(p => payableIds.has(p.employee_id))
+
+  const totalSalary = employees.filter(isPayable).reduce((s, e) => s + Number(e.monthly_salary), 0)
+  const paidCount = payrollRows.filter(p => p.status === 'Paid').length
+  const dueCount = Math.max(0, activeCount - paidCount)
+  const paidAmount = payrollRows.filter(p => p.status === 'Paid').reduce((s, p) => s + Number(p.amount), 0)
+  const dueAmount = Math.max(0, totalSalary - paidAmount)
 
   // ─── Filter ───────────────────────────────────────────────────
   const filtered = employees.filter(e =>
@@ -282,56 +334,67 @@ export default function Employees() {
   ].filter(d => d.value > 0)
 
   // ─── Bar chart data (by role) ─────────────────────────────────
+  // Paid and Due both count Active staff only. Due used to be "everyone's
+  // salary minus what was paid", so an Inactive or On Leave employee showed
+  // up as money owed even though they are not on payroll at all.
   const roleBarData = ROLES.map(role => {
-    const emps = employees.filter(e => e.role === role)
+    const emps = employees.filter(e => e.role === role && isPayable(e))
     const rolePaid = emps.reduce((s, e) => {
       const p = payments.find(p => p.employee_id === e.id && p.status === 'Paid')
       return s + (p ? Number(p.amount) : 0)
     }, 0)
-    const roleDue = emps.reduce((s, e) => s + Number(e.monthly_salary), 0) - rolePaid
+    const roleDue = emps.reduce((s, e) => {
+      const p = payments.find(p => p.employee_id === e.id)
+      return p?.status === 'Paid' ? s : s + Number(p?.amount ?? e.monthly_salary)
+    }, 0)
     return { role: role.split(' ').map(w => w[0]).join(''), fullRole: role, paid: rolePaid, due: roleDue }
   })
 
   // ─── Chart click handlers ─────────────────────────────────────
+  const rowFor = (e: Employee): ChartRow => {
+    const p = payments.find(px => px.employee_id === e.id)
+    return {
+      emp: e,
+      isPaid: isPayable(e) && p?.status === 'Paid',
+      payable: isPayable(e),
+      amount: Number(p?.amount ?? e.monthly_salary),
+    }
+  }
+
   const openPieModal = (data: any) => {
     if (!data) return
-    const isPaidSlice = data.name === 'Paid'
-    const relevant = employees.filter(e => getPaymentStatus(e.id) === (isPaidSlice ? 'Paid' : 'Due'))
+    // Load everyone, not just the slice that was clicked — the slice only
+    // decides which tab opens first, so both totals stay real either way.
     setChartModal({
-      title: isPaidSlice ? 'Paid Employees' : 'Unpaid Employees',
-      subtitle: `${relevant.length} employee${relevant.length !== 1 ? 's' : ''} · $${data.value.toLocaleString()} total`,
-      color: isPaidSlice ? '#22d3a8' : '#f43f5e',
-      rows: relevant.map(e => {
-        const p = payments.find(px => px.employee_id === e.id)
-        return { emp: e, isPaid: isPaidSlice, amount: Number(p?.amount ?? e.monthly_salary) }
-      }),
-      totalPaid: isPaidSlice ? data.value : 0,
-      totalDue: isPaidSlice ? 0 : data.value,
+      title: 'Salary Status',
+      titleByView: { paid: 'Paid Employees', due: 'Unpaid Employees', off: 'Off Payroll' },
+      color: data.name === 'Paid' ? '#22d3a8' : '#f43f5e',
+      rows: employees.map(rowFor),
+      totalPaid: paidAmount,
+      totalDue: dueAmount,
+      initialView: data.name === 'Paid' ? 'paid' : 'due',
     })
   }
 
   const openBarModal = (data: any) => {
     if (!data?.fullRole) return
-    const roleEmps = employees.filter(e => e.role === data.fullRole)
-    const color = roleColors[data.fullRole] || '#6C63FF'
+    const rows = employees.filter(e => e.role === data.fullRole).map(rowFor)
     setChartModal({
       title: data.fullRole,
-      subtitle: `${roleEmps.length} employee${roleEmps.length !== 1 ? 's' : ''} · $${(data.paid + data.due).toLocaleString()}/mo`,
-      color,
-      rows: roleEmps.map(e => {
-        const p = payments.find(px => px.employee_id === e.id)
-        const isPaid = p?.status === 'Paid'
-        return { emp: e, isPaid, amount: Number(p?.amount ?? e.monthly_salary) }
-      }),
+      color: roleColors[data.fullRole] || '#6C63FF',
+      rows,
       totalPaid: data.paid,
       totalDue: data.due,
+      // Open on whichever side has money outstanding; fall back to whatever
+      // the role actually has so the first tab is never empty.
+      initialView: data.due > 0 ? 'due' : data.paid > 0 ? 'paid' : (rows[0] ? viewOf(rows[0]) : 'due'),
     })
   }
 
   // ─── Render ───────────────────────────────────────────────────
   return (
     <div className="page-enter">
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page-header page-header-row">
         <div>
           <h1>Employees</h1>
           <p>Manage workforce profiles, roles, and salary payments</p>
@@ -346,8 +409,8 @@ export default function Employees() {
         {[
           { label: 'Total Employees', value: totalEmployees, icon: Users, color: '#6C63FF', key: 'total' as const },
           { label: 'Active', value: activeCount, icon: UserCheck, color: '#22d3a8', key: 'active' as const },
-          { label: 'Salary Paid', value: paidCount, sub: `$${paidAmount.toLocaleString()} paid this month`, icon: CheckCircle, color: '#00D4FF', key: 'paid' as const },
-          { label: 'Salary Due', value: dueCount, sub: `$${dueAmount.toLocaleString()} outstanding`, icon: AlertCircle, color: '#f43f5e', key: 'due' as const },
+          { label: 'Salary Paid', value: paidCount, sub: `${symbol}${paidAmount.toLocaleString()} paid this month`, icon: CheckCircle, color: '#00D4FF', key: 'paid' as const },
+          { label: 'Salary Due', value: dueCount, sub: `${symbol}${dueAmount.toLocaleString()} outstanding`, icon: AlertCircle, color: '#f43f5e', key: 'due' as const },
         ].map(s => (
           <div
             key={s.label}
@@ -444,7 +507,7 @@ export default function Employees() {
               >
                 <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
                 <XAxis dataKey="role" tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={(v) => `$${v >= 1000 ? `${(v/1000).toFixed(0)}k` : v}`} />
+                <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${symbol}${v >= 1000 ? `${(v/1000).toFixed(0)}k` : v}`} />
                 <Tooltip
                   cursor={{ fill: 'rgba(255,255,255,0.04)', radius: 6 } as any}
                   content={({ active, payload, label }) => {
@@ -553,6 +616,7 @@ export default function Employees() {
                     {emps.map(emp => {
                       const pStatus = getPaymentStatus(emp.id)
                       const isPaid = pStatus === 'Paid'
+                      const payable = pStatus !== 'N/A'
                       return (
                         <div
                           key={emp.id}
@@ -595,11 +659,19 @@ export default function Employees() {
                               <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'var(--font-display)' }}>${Number(emp.monthly_salary).toLocaleString()}</div>
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <span className={`badge ${isPaid ? 'badge-success' : 'badge-danger'}`}>{isPaid ? '✓ Paid' : '● Due'}</span>
-                              {!isPaid && (
-                                <button className="btn btn-primary btn-sm" style={{ padding: '5px 12px', fontSize: 11 }} onClick={(e) => { e.stopPropagation(); payEmployee(emp.id) }}>
-                                  <DollarSign size={12} /> Pay
-                                </button>
+                              {payable ? (
+                                <>
+                                  <span className={`badge ${isPaid ? 'badge-success' : 'badge-danger'}`}>{isPaid ? '✓ Paid' : '● Due'}</span>
+                                  {!isPaid && (
+                                    <button className="btn btn-primary btn-sm" style={{ padding: '5px 12px', fontSize: 11 }} onClick={(e) => { e.stopPropagation(); payEmployee(emp.id) }}>
+                                      <DollarSign size={12} /> Pay
+                                    </button>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="badge" style={{ background: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.45)', border: '1px solid rgba(255,255,255,0.12)' }}>
+                                  Not on payroll
+                                </span>
                               )}
                             </div>
                           </div>
@@ -660,11 +732,47 @@ export default function Employees() {
 //  CHART DETAIL MODAL — click pie segment or bar to open
 // ═══════════════════════════════════════════════════════════════
 function ChartDetailModal({ data, onClose, onSelectEmployee, yearsWorking }: {
-  data: { title: string; subtitle: string; color: string; rows: { emp: Employee; isPaid: boolean; amount: number }[]; totalPaid: number; totalDue: number }
+  data: ChartModalData
   onClose: () => void
   onSelectEmployee: (emp: Employee) => void
   yearsWorking: (date: string) => number
 }) {
+  const { symbol } = useLocale()
+  const [view, setView] = useState<ChartView>(data.initialView)
+
+  const visible = data.rows.filter(r => viewOf(r) === view)
+  const offCount = data.rows.filter(r => viewOf(r) === 'off').length
+  const visibleTotal = visible.reduce((s, r) => s + r.amount, 0)
+
+  const heading = data.titleByView?.[view] ?? data.title
+  const subtitle = `${visible.length} employee${visible.length !== 1 ? 's' : ''} · ${symbol}${visibleTotal.toLocaleString()}`
+
+  const accent: Record<ChartView, string> = { paid: '#22d3a8', due: '#f43f5e', off: 'rgba(255,255,255,0.5)' }
+  const tone = accent[view]
+
+  // The summary cards double as tabs. Each keeps showing its real total
+  // whichever tab is active, so the two views no longer contradict each other.
+  const tab = (key: ChartView, value: string, label: string) => {
+    const on = view === key
+    const c = accent[key]
+    return (
+      <button
+        key={key}
+        onClick={() => setView(key)}
+        style={{
+          background: on ? `${c === accent.off ? 'rgba(255,255,255,0.10)' : `${c}1f`}` : 'rgba(255,255,255,0.03)',
+          borderRadius: 10, padding: '8px 12px', textAlign: 'center', cursor: 'pointer',
+          border: `1px solid ${on ? (c === accent.off ? 'rgba(255,255,255,0.28)' : `${c}66`) : 'rgba(255,255,255,0.08)'}`,
+          boxShadow: on && c !== accent.off ? `0 0 0 1px ${c}33 inset` : 'none',
+          transition: 'all 0.15s', font: 'inherit', opacity: on ? 1 : 0.62,
+        }}
+      >
+        <div style={{ fontSize: 17, fontWeight: 700, fontFamily: 'var(--font-display)', color: c }}>{value}</div>
+        <div style={{ fontSize: 10, color: 'var(--clr-text-muted)', marginTop: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
+      </button>
+    )
+  }
+
   return createPortal(
     <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(5,8,16,0.45)', backdropFilter: 'blur(14px)', WebkitBackdropFilter: 'blur(14px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }} onClick={onClose}>
       <div
@@ -673,15 +781,15 @@ function ChartDetailModal({ data, onClose, onSelectEmployee, yearsWorking }: {
         onClick={e => e.stopPropagation()}
       >
         {/* Header */}
-        <div style={{ padding: '16px 20px 12px', background: `linear-gradient(135deg, ${data.color}18, transparent)`, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+        <div style={{ padding: '16px 20px 12px', background: `linear-gradient(135deg, ${tone}18, transparent)`, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0, transition: 'background 0.2s' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <div style={{ width: 34, height: 34, borderRadius: 10, background: `${data.color}22`, border: `1px solid ${data.color}44`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <DollarSign size={16} color={data.color} />
+              <div style={{ width: 34, height: 34, borderRadius: 10, background: `${tone}22`, border: `1px solid ${tone}44`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <DollarSign size={16} color={tone} />
               </div>
               <div>
-                <div style={{ fontWeight: 700, fontSize: 15, fontFamily: 'var(--font-display)' }}>{data.title}</div>
-                <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 1 }}>{data.subtitle}</div>
+                <div style={{ fontWeight: 700, fontSize: 15, fontFamily: 'var(--font-display)' }}>{heading}</div>
+                <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 1 }}>{subtitle}</div>
               </div>
             </div>
             <button onClick={onClose} style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', cursor: 'pointer', borderRadius: '50%', width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -690,30 +798,25 @@ function ChartDetailModal({ data, onClose, onSelectEmployee, yearsWorking }: {
           </div>
         </div>
 
-        {/* Summary strip */}
-        {(data.totalPaid > 0 || data.totalDue > 0) && (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, padding: '12px 20px', borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
-            <div style={{ background: 'rgba(34,211,168,0.05)', borderRadius: 10, padding: '8px 12px', border: '1px solid rgba(34,211,168,0.12)', textAlign: 'center' }}>
-              <div style={{ fontSize: 17, fontWeight: 700, fontFamily: 'var(--font-display)', color: '#22d3a8' }}>${data.totalPaid.toLocaleString()}</div>
-              <div style={{ fontSize: 10, color: 'var(--clr-text-muted)', marginTop: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Paid</div>
-            </div>
-            <div style={{ background: 'rgba(244,63,94,0.05)', borderRadius: 10, padding: '8px 12px', border: '1px solid rgba(244,63,94,0.12)', textAlign: 'center' }}>
-              <div style={{ fontSize: 17, fontWeight: 700, fontFamily: 'var(--font-display)', color: '#f43f5e' }}>${data.totalDue.toLocaleString()}</div>
-              <div style={{ fontSize: 10, color: 'var(--clr-text-muted)', marginTop: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Due</div>
-            </div>
-          </div>
-        )}
+        {/* Summary strip — also the view switcher */}
+        <div style={{ display: 'grid', gridTemplateColumns: offCount > 0 ? '1fr 1fr 1fr' : '1fr 1fr', gap: 10, padding: '12px 20px', borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+          {tab('paid', `${symbol}${data.totalPaid.toLocaleString()}`, 'Paid')}
+          {tab('due', `${symbol}${data.totalDue.toLocaleString()}`, 'Due')}
+          {offCount > 0 && tab('off', String(offCount), 'Off payroll')}
+        </div>
 
         {/* Employee list */}
         <div style={{ overflowY: 'auto', flex: 1, padding: '10px 20px 16px' }}>
-          {data.rows.length === 0 ? (
+          {visible.length === 0 ? (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 40, gap: 10 }}>
               <Users size={32} color="rgba(255,255,255,0.15)" />
-              <div style={{ color: 'var(--clr-text-muted)', fontSize: 13 }}>No employees in this category</div>
+              <div style={{ color: 'var(--clr-text-muted)', fontSize: 13 }}>
+                {view === 'paid' ? 'Nobody has been paid yet this month' : view === 'due' ? 'Everyone on payroll has been paid' : 'Everyone is on payroll'}
+              </div>
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {data.rows.map(({ emp, isPaid, amount }) => {
+              {visible.map(({ emp, isPaid, payable, amount }) => {
                 const color = roleColors[emp.role] || '#6C63FF'
                 return (
                   <div key={emp.id} onClick={() => onSelectEmployee(emp)} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', cursor: 'pointer', transition: 'all 0.15s' }}
@@ -733,7 +836,11 @@ function ChartDetailModal({ data, onClose, onSelectEmployee, yearsWorking }: {
                     </div>
                     <div style={{ textAlign: 'right', flexShrink: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: 14, fontFamily: 'var(--font-display)' }}>${amount.toLocaleString()}</div>
-                      <span className={`badge ${isPaid ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: 10, padding: '2px 7px', marginTop: 3 }}>{isPaid ? '✓ Paid' : '● Due'}</span>
+                      {payable ? (
+                        <span className={`badge ${isPaid ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: 10, padding: '2px 7px', marginTop: 3 }}>{isPaid ? '✓ Paid' : '● Due'}</span>
+                      ) : (
+                        <span className="badge" style={{ fontSize: 10, padding: '2px 7px', marginTop: 3, background: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.45)', border: '1px solid rgba(255,255,255,0.12)' }}>Not on payroll</span>
+                      )}
                     </div>
                   </div>
                 )
@@ -744,7 +851,7 @@ function ChartDetailModal({ data, onClose, onSelectEmployee, yearsWorking }: {
 
         {/* Footer */}
         <div style={{ padding: '10px 20px', borderTop: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0, background: 'rgba(0,0,0,0.15)' }}>
-          <div style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>{data.rows.length} employee{data.rows.length !== 1 ? 's' : ''} · Click a row to view profile</div>
+          <div style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>{data.rows.length} employee{data.rows.length !== 1 ? 's' : ''} total · Click a row to view profile</div>
           <div style={{ fontWeight: 700, fontSize: 13, color: data.color }}>${(data.totalPaid + data.totalDue).toLocaleString()}/mo</div>
         </div>
       </div>
@@ -765,15 +872,16 @@ function StatListModal({
   onClose: () => void
   onSelectEmployee: (emp: Employee) => void
   yearsWorking: (date: string) => number
-  getPaymentStatus: (id: string) => 'Paid' | 'Due'
+  getPaymentStatus: (id: string) => 'Paid' | 'Due' | 'N/A'
   paidAmount: number
   dueAmount: number
 }) {
+  const { symbol, fmtDate } = useLocale()
   const config = {
     total: { title: 'All Employees', color: '#6C63FF', icon: Users, subtitle: `${employees.length} total` },
     active: { title: 'Active Employees', color: '#22d3a8', icon: UserCheck, subtitle: `${employees.filter(e => e.status === 'Active').length} currently active` },
-    paid: { title: 'Salary Paid', color: '#00D4FF', icon: CheckCircle, subtitle: `$${paidAmount.toLocaleString()} paid this month` },
-    due: { title: 'Salary Due', color: '#f43f5e', icon: AlertCircle, subtitle: `$${dueAmount.toLocaleString()} outstanding this month` },
+    paid: { title: 'Salary Paid', color: '#00D4FF', icon: CheckCircle, subtitle: `${symbol}${paidAmount.toLocaleString()} paid this month` },
+    due: { title: 'Salary Due', color: '#f43f5e', icon: AlertCircle, subtitle: `${symbol}${dueAmount.toLocaleString()} outstanding this month` },
   }[type]
 
   const list = employees.filter(emp => {
@@ -904,10 +1012,16 @@ function StatListModal({
                         ${Number(emp.monthly_salary).toLocaleString()}
                       </div>
                       <div style={{ marginTop: 4 }}>
-                        <span className={`badge ${isPaid ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: 10, padding: '2px 8px' }}>
-                          {isPaid ? '✓ Paid' : '● Due'}
-                          {payment?.paid_at && isPaid ? ` · ${new Date(payment.paid_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}` : ''}
-                        </span>
+                        {pStatus === 'N/A' ? (
+                          <span className="badge" style={{ fontSize: 10, padding: '2px 8px', background: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.45)', border: '1px solid rgba(255,255,255,0.12)' }}>
+                            Not on payroll
+                          </span>
+                        ) : (
+                          <span className={`badge ${isPaid ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: 10, padding: '2px 8px' }}>
+                            {isPaid ? '✓ Paid' : '● Due'}
+                            {payment?.paid_at && isPaid ? ` · ${fmtDate(payment.paid_at, { month: 'short', day: 'numeric' })}` : ''}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1123,8 +1237,19 @@ function ProfileModal({
   yearsWorking: number
   roleColor: string
 }) {
+  const { fmtDate } = useLocale()
   const [showHistory, setShowHistory] = useState(false)
-  const isPaid = payment?.status === 'Paid'
+  const payable = isPayable(employee)
+  const isPaid = payable && payment?.status === 'Paid'
+
+  // Non-Active staff accrue nothing this month, so the salary card reads as a
+  // greyed-out reference figure rather than as money owed.
+  const salaryTone = !payable
+    ? { bg: 'rgba(255,255,255,0.03)', border: 'rgba(255,255,255,0.10)' }
+    : isPaid
+      ? { bg: 'rgba(34,211,168,0.06)', border: 'rgba(34,211,168,0.2)' }
+      : { bg: 'rgba(244,63,94,0.06)', border: 'rgba(244,63,94,0.2)' }
+  const monthLabel = fmtDate(new Date(), { month: 'long', year: 'numeric', day: undefined })
 
   return (
     <>
@@ -1185,7 +1310,7 @@ function ProfileModal({
                   { icon: Phone, label: 'Emergency', value: employee.emergency_contact },
                   { icon: Droplets, label: 'Blood Group', value: employee.blood_group },
                   { icon: MapPin, label: 'Address', value: employee.address },
-                  { icon: Calendar, label: 'Joined', value: employee.joined_date ? new Date(employee.joined_date).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : '–' },
+                  { icon: Calendar, label: 'Joined', value: employee.joined_date ? fmtDate(employee.joined_date, { year: 'numeric', month: 'short', day: 'numeric' }) : '–' },
                 ].map((item, i) => (
                   <div key={i} style={{ background: 'rgba(255,255,255,0.03)', borderRadius: 8, padding: '7px 10px', border: '1px solid rgba(255,255,255,0.06)', gridColumn: item.label === 'Address' ? '1 / -1' : undefined }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--clr-text-muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>
@@ -1197,16 +1322,28 @@ function ProfileModal({
               </div>
 
               {/* Salary Section */}
-              <div style={{ background: isPaid ? 'rgba(34,211,168,0.06)' : 'rgba(244,63,94,0.06)', border: `1px solid ${isPaid ? 'rgba(34,211,168,0.2)' : 'rgba(244,63,94,0.2)'}`, borderRadius: 'var(--r-md)', padding: '10px 14px', marginBottom: 12 }}>
+              <div style={{ background: salaryTone.bg, border: `1px solid ${salaryTone.border}`, borderRadius: 'var(--r-md)', padding: '10px 14px', marginBottom: 12 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <div>
                     <div style={{ fontSize: 10, color: 'var(--clr-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>Monthly Salary</div>
-                    <div style={{ fontSize: 22, fontWeight: 700, fontFamily: 'var(--font-display)' }}>${Number(employee.monthly_salary).toLocaleString()}</div>
-                    <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>{yearsWorking} yr{yearsWorking !== 1 ? 's' : ''} with company</div>
+                    <div style={{ fontSize: 22, fontWeight: 700, fontFamily: 'var(--font-display)', opacity: payable ? 1 : 0.45 }}>${Number(employee.monthly_salary).toLocaleString()}</div>
+                    <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>
+                      {payable
+                        ? `${yearsWorking} yr${yearsWorking !== 1 ? 's' : ''} with company`
+                        : `${employee.status} · no salary for ${monthLabel}`}
+                    </div>
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
-                    <span className={`badge ${isPaid ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: 12, padding: '4px 12px' }}>{isPaid ? '✓ Paid' : '● Due'}</span>
-                    {!isPaid && <button className="btn btn-primary btn-sm" onClick={onPay}><DollarSign size={12} /> Mark as Paid</button>}
+                    {payable ? (
+                      <>
+                        <span className={`badge ${isPaid ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: 12, padding: '4px 12px' }}>{isPaid ? '✓ Paid' : '● Due'}</span>
+                        {!isPaid && <button className="btn btn-primary btn-sm" onClick={onPay}><DollarSign size={12} /> Mark as Paid</button>}
+                      </>
+                    ) : (
+                      <span className="badge" style={{ fontSize: 12, padding: '4px 12px', background: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.45)', border: '1px solid rgba(255,255,255,0.12)' }}>
+                        Not on payroll
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1244,18 +1381,28 @@ function HistoryModal({ employee, roleColor, onClose }: {
   roleColor: string
   onClose: () => void
 }) {
+  const { symbol, fmtDate } = useLocale()
   const [records, setRecords] = useState<SalaryPayment[]>([])
+  const [statusLog, setStatusLog] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     const load = async () => {
-      const { data } = await supabase
-        .from('salary_payments')
-        .select('*')
-        .eq('employee_id', employee.id)
-        .order('payment_year', { ascending: false })
-        .order('payment_month', { ascending: false })
+      const [{ data }, { data: log }] = await Promise.all([
+        supabase
+          .from('salary_payments')
+          .select('*')
+          .eq('employee_id', employee.id)
+          .order('payment_year', { ascending: false })
+          .order('payment_month', { ascending: false }),
+        supabase
+          .from('employee_status_history')
+          .select('*')
+          .eq('employee_id', employee.id)
+          .order('changed_at', { ascending: false }),
+      ])
       if (data) setRecords(data)
+      if (log) setStatusLog(log)
       setLoading(false)
     }
     load()
@@ -1266,7 +1413,7 @@ function HistoryModal({ employee, roleColor, onClose }: {
   const monthsPaid = records.filter(r => r.status === 'Paid').length
   const monthsDue = records.filter(r => r.status === 'Due').length
   const joinedLabel = employee.joined_date
-    ? new Date(employee.joined_date).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+    ? fmtDate(employee.joined_date, { month: 'short', year: 'numeric' })
     : '–'
 
   return createPortal(
@@ -1308,7 +1455,7 @@ function HistoryModal({ employee, roleColor, onClose }: {
         {/* Summary strip */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, padding: '12px 20px', borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
           {[
-            { label: 'Total Paid', value: `$${totalPaid.toLocaleString()}`, color: '#22d3a8' },
+            { label: 'Total Paid', value: `${symbol}${totalPaid.toLocaleString()}`, color: '#22d3a8' },
             { label: 'Months Paid', value: String(monthsPaid), color: '#00D4FF' },
             { label: 'Months Due', value: String(monthsDue), color: '#f43f5e' },
             { label: 'Since', value: joinedLabel, color: roleColor },
@@ -1322,6 +1469,47 @@ function HistoryModal({ employee, roleColor, onClose }: {
 
         {/* Records */}
         <div style={{ overflowY: 'auto', flex: 1, padding: '10px 20px 16px' }}>
+          {/* Status history — which months this person was off payroll, and why
+              a month may show no salary record at all. */}
+          {!loading && statusLog.length > 0 && (
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--clr-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', padding: '4px 10px 8px' }}>
+                Status history
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                {statusLog.map(h => {
+                  const active = (h.status || '').trim().toLowerCase() === 'active'
+                  const tone = active ? '#22d3a8' : h.status === 'On Leave' ? '#f59e0b' : 'rgba(255,255,255,0.45)'
+                  return (
+                    <div key={h.id} style={{
+                      display: 'flex', alignItems: 'center', gap: 10,
+                      padding: '9px 10px', borderRadius: 10,
+                      background: 'rgba(255,255,255,0.03)',
+                      border: `1px solid ${active ? 'rgba(34,211,168,0.14)' : 'rgba(255,255,255,0.08)'}`,
+                    }}>
+                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: tone, flexShrink: 0 }} />
+                      <div style={{ flex: 1, minWidth: 0, fontSize: 12.5 }}>
+                        <span style={{ color: tone, fontWeight: 700 }}>{h.status}</span>
+                        {h.previous_status && (
+                          <span style={{ color: 'rgba(255,255,255,0.35)' }}> · from {h.previous_status}</span>
+                        )}
+                        {!active && (
+                          <span style={{ color: 'rgba(255,255,255,0.35)' }}> · no salary for this month</span>
+                        )}
+                        {h.note && (
+                          <span style={{ color: 'rgba(255,255,255,0.3)' }}> · {h.note}</span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', flexShrink: 0, fontWeight: 600 }}>
+                        {MONTHS[(h.effective_month || 1) - 1]} {h.effective_year}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
           {loading ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {[1,2,3,4].map(i => <div key={i} className="shimmer" style={{ height: 44, borderRadius: 10 }} />)}
@@ -1356,7 +1544,7 @@ function HistoryModal({ employee, roleColor, onClose }: {
                       </div>
                       <div style={{ fontWeight: 700, fontSize: 13, fontFamily: 'var(--font-display)' }}>${Number(r.amount).toLocaleString()}</div>
                       <div style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>
-                        {r.paid_at ? new Date(r.paid_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—'}
+                        {r.paid_at ? fmtDate(r.paid_at, { month: 'short', day: 'numeric', year: 'numeric' }) : '—'}
                       </div>
                     </div>
                   )

@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '../lib/supabaseClient'
+import { useLocale } from '../lib/locale'
 import { sendOrderEmail } from '../lib/restock'
+import { useLiveData } from '../lib/useLiveData'
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Cell } from 'recharts'
 import {
   RefreshCw, AlertTriangle, CheckCircle, Clock,
@@ -59,7 +61,9 @@ const orderStatusColor: Record<string, string> = {
 // quick-restock button send byte-identical purchase orders.
 
 // Plain-text preview shown inside the modal (not the real email, just for review)
-function buildEmailPreview(vendor: Vendor, items: OrderItem[], notes: string, expectedDelivery: string) {
+// `symbol` is passed rather than read from context: this is a plain function,
+// not a component, so it cannot call the locale hook itself.
+function buildEmailPreview(vendor: Vendor, items: OrderItem[], notes: string, expectedDelivery: string, symbol: string) {
   const total = items.reduce((s, i) => s + i.quantity * i.unit_cost, 0)
   return [
     `To: ${vendor.email || '(no email on file)'}`,
@@ -68,10 +72,10 @@ function buildEmailPreview(vendor: Vendor, items: OrderItem[], notes: string, ex
     `Dear ${vendor.name},`,
     '',
     ...items.map((item, i) =>
-      `${i + 1}. ${item.product_name}${item.sku ? ` (${item.sku})` : ''}  ×${item.quantity}  @ $${Number(item.unit_cost).toFixed(2)}  = $${(item.quantity * item.unit_cost).toFixed(2)}`
+      `${i + 1}. ${item.product_name}${item.sku ? ` (${item.sku})` : ''}  ×${item.quantity}  @ ${symbol}${Number(item.unit_cost).toFixed(2)}  = ${symbol}${(item.quantity * item.unit_cost).toFixed(2)}`
     ),
     '',
-    `Total: $${total.toFixed(2)}`,
+    `Total: ${symbol}${total.toFixed(2)}`,
     `Payment: ${vendor.payment_terms}`,
     expectedDelivery ? `Deliver by: ${expectedDelivery}` : '',
     notes ? `Notes: ${notes}` : '',
@@ -213,6 +217,7 @@ function VendorProfileModal({ vendor, orders, onClose, onEdit, onDelete, onOrder
   vendor: Vendor; orders: RestockOrder[]
   onClose: () => void; onEdit: () => void; onDelete: () => void; onOrder: () => void; onHistory: () => void
 }) {
+  const { symbol } = useLocale()
   const color = catColors[vendor.category] || '#6C63FF'
   const initials = vendor.company.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase()
   const totalValue = orders.reduce((s, o) => s + Number(o.total_cost), 0)
@@ -240,19 +245,28 @@ function VendorProfileModal({ vendor, orders, onClose, onEdit, onDelete, onOrder
         </div>
 
         <div style={{ padding: '20px 24px' }}>
-          {/* Stats */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 18 }}>
-            {[
-              { label: 'Orders', value: orders.length.toString() },
-              { label: 'Total Value', value: totalValue >= 1000 ? `$${(totalValue / 1000).toFixed(1)}k` : `$${totalValue.toFixed(0)}` },
-              { label: 'Lead Time', value: `${vendor.lead_time_days}d` },
-            ].map(s => (
-              <div key={s.label} style={{ textAlign: 'center', padding: '10px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: 10, border: '1px solid rgba(255,255,255,0.06)' }}>
-                <div style={{ fontSize: 19, fontWeight: 700, color }}>{s.value}</div>
-                <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>{s.label}</div>
+          {/* Stats. Paid vs still-owed split out so the vendor profile says
+              what has actually been settled, not just what was ordered. */}
+          {(() => {
+            const money = (n: number) => n >= 1000 ? `${symbol}${(n / 1000).toFixed(1)}k` : `${symbol}${n.toFixed(0)}`
+            const paid = orders.filter((o: any) => o.paid_at).reduce((s: number, o: any) => s + (Number(o.total_cost) || 0), 0)
+            const owed = orders.filter((o: any) => !o.paid_at).reduce((s: number, o: any) => s + (Number(o.total_cost) || 0), 0)
+            return (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 18 }}>
+                {[
+                  { label: 'Orders', value: orders.length.toString(), c: color },
+                  { label: 'Paid', value: money(paid), c: '#22d3a8' },
+                  { label: 'Owed', value: money(owed), c: owed > 0 ? '#f43f5e' : '#22d3a8' },
+                  { label: 'Lead Time', value: `${vendor.lead_time_days}d`, c: color },
+                ].map(s => (
+                  <div key={s.label} style={{ textAlign: 'center', padding: '10px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: 10, border: '1px solid rgba(255,255,255,0.06)' }}>
+                    <div style={{ fontSize: 17, fontWeight: 700, color: s.c, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.value}</div>
+                    <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>{s.label}</div>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
+            )
+          })()}
 
           {/* Details */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 18 }}>
@@ -287,6 +301,7 @@ function OrderModal({ vendor, prefillItem, onClose, onSaved }: {
   onClose: () => void
   onSaved: () => void
 }) {
+  const { symbol } = useLocale()
   const [items, setItems] = useState<OrderItem[]>(
     prefillItem
       ? [{ product_name: prefillItem.name, sku: prefillItem.sku, quantity: prefillItem.suggest, unit_cost: prefillItem.unitCost ?? 0 }]
@@ -421,7 +436,7 @@ function OrderModal({ vendor, prefillItem, onClose, onSaved }: {
         </button>
         {showPreview && (
           <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 10, padding: 14, marginBottom: 14, fontSize: 12, fontFamily: 'monospace', whiteSpace: 'pre-wrap', maxHeight: 220, overflowY: 'auto', color: 'rgba(255,255,255,0.65)', lineHeight: 1.6 }}>
-            {buildEmailPreview(vendor, validItems.length ? validItems : items, notes, expectedDelivery)}
+            {buildEmailPreview(vendor, validItems.length ? validItems : items, notes, expectedDelivery, symbol)}
           </div>
         )}
 
@@ -467,6 +482,7 @@ function OrderHistoryModal({ vendor, orders, onClose, onRefresh }: {
   vendor: Vendor; orders: RestockOrder[]
   onClose: () => void; onRefresh: () => void
 }) {
+  const { fmtDate } = useLocale()
   const color = catColors[vendor.category] || '#6C63FF'
 
   // Inventory is already credited when the order is placed (so it leaves the
@@ -505,7 +521,7 @@ function OrderHistoryModal({ vendor, orders, onClose, onRefresh }: {
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                       <span style={{ fontWeight: 600, fontSize: 12, color, fontFamily: 'monospace' }}>#{order.id.slice(-8).toUpperCase()}</span>
-                      <span style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>{new Date(order.ordered_at).toLocaleDateString()}</span>
+                      <span style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>{fmtDate(order.ordered_at)}</span>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ fontWeight: 700, fontSize: 14, color: sc }}>${Number(order.total_cost).toFixed(2)}</span>
@@ -525,7 +541,7 @@ function OrderHistoryModal({ vendor, orders, onClose, onRefresh }: {
                   {order.notes && <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginBottom: 8, fontStyle: 'italic' }}>{order.notes}</p>}
                   {order.expected_delivery && (
                     <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginBottom: 8 }}>
-                      Expected: {new Date(order.expected_delivery).toLocaleDateString()}
+                      Expected: {fmtDate(order.expected_delivery)}
                     </p>
                   )}
 
@@ -663,6 +679,7 @@ function VendorPickerModal({ item, onPick, onClose }: {
 
 // ─── Main Component ───────────────────────────────────────────────
 export default function Restock() {
+  const { symbol, fmtDate } = useLocale()
   const [tab, setTab] = useState<'queue' | 'vendors'>('queue')
 
   // Queue state
@@ -692,6 +709,13 @@ export default function Restock() {
 
   useEffect(() => { fetchData(); fetchVendors(); fetchFamilies() }, [])
 
+  // A sale anywhere moves stock, and the restock agent reacts to it within
+  // seconds. Without this the queue showed whatever was true at mount.
+  useLiveData('restock-live', ['inventory', 'sales_transactions', 'restock_orders', 'vendors'], () => {
+    fetchData({ silent: true })
+    fetchVendors({ silent: true })
+  })
+
   async function fetchFamilies() {
     const { data } = await supabase.from('products').select('family').order('family')
     if (data) {
@@ -701,8 +725,8 @@ export default function Restock() {
     }
   }
 
-  async function fetchData() {
-    setLoading(true)
+  async function fetchData({ silent = false }: { silent?: boolean } = {}) {
+    if (!silent) setLoading(true)
     try {
     const { data: invData } = await supabase
       .from('inventory')
@@ -759,12 +783,12 @@ export default function Restock() {
     } catch (err) {
       console.error('Error fetching restock data:', err)
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }
 
-  async function fetchVendors() {
-    setVendorLoading(true)
+  async function fetchVendors({ silent = false }: { silent?: boolean } = {}) {
+    if (!silent) setVendorLoading(true)
     try {
       const [{ data: vdata }, { data: odata }] = await Promise.all([
         supabase.from('vendors').select('*').order('company'),
@@ -775,7 +799,7 @@ export default function Restock() {
     } catch (err) {
       console.error('Error fetching vendors:', err)
     } finally {
-      setVendorLoading(false)
+      if (!silent) setVendorLoading(false)
     }
   }
 
@@ -848,7 +872,7 @@ export default function Restock() {
   return (
     <div className="page-enter">
       {/* Page header */}
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div className="page-header page-header-row">
         <div>
           <h1>Restock & Vendors</h1>
           <p>Live restock queue, vendor directory, and email-based purchase orders</p>
@@ -1292,7 +1316,7 @@ export default function Restock() {
                         <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
                           {[
                             { label: 'Orders', value: thisMonthOrders.length.toString(), color: '#f59e0b' },
-                            { label: 'Total Value', value: `$${thisMonthOrders.reduce((s, o) => s + Number(o.total_cost), 0).toFixed(0)}`, color: '#22d3a8' },
+                            { label: 'Total Value', value: `${symbol}${thisMonthOrders.reduce((s, o) => s + Number(o.total_cost), 0).toFixed(0)}`, color: '#22d3a8' },
                             { label: 'Delivered', value: thisMonthOrders.filter(o => o.status === 'Delivered').length.toString(), color: '#6C63FF' },
                           ].map(s => (
                             <div key={s.label} style={{ flex: 1, padding: '12px 14px', borderRadius: 10, background: `${s.color}0d`, border: `1px solid ${s.color}22`, transition: 'box-shadow 0.2s ease, transform 0.15s ease', cursor: 'default' }}
@@ -1322,7 +1346,7 @@ export default function Restock() {
                                     <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 20, background: `${sc}22`, color: sc, fontWeight: 600 }}>{o.status}</span>
                                   </div>
                                 </div>
-                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{o.items?.length || 0} item{(o.items?.length || 0) !== 1 ? 's' : ''} · {new Date(o.ordered_at).toLocaleDateString()}</p>
+                                <p style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{o.items?.length || 0} item{(o.items?.length || 0) !== 1 ? 's' : ''} · {fmtDate(o.ordered_at)}</p>
                               </div>
                             )
                           })}

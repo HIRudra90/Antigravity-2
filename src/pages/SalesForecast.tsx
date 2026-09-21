@@ -1,8 +1,12 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
+import { useLocale } from '../lib/locale'
 import { skuFor } from '../lib/restock'
+import {
+  backendFetch, wakeBackend, describeBackendError, ModelStatus, MarketInsight,
+} from '../lib/backend'
 import {
   AreaChart, Area, LineChart, Line,
   ScatterChart, Scatter,
@@ -24,6 +28,7 @@ const ORDER_UP_TO_DAYS   = 45   // S — order enough to reach this much cover
 
 
 export default function SalesForecast() {
+  const { symbol, fmtDateTime } = useLocale()
   const navigate = useNavigate()
 
   // Tab control
@@ -44,7 +49,11 @@ export default function SalesForecast() {
   const [selectedProductId, setSelectedProductId] = useState<string>('')
   const [selectedProduct, setSelectedProduct] = useState<any>(null)
   
+  // Seeded from Settings → AI → Default Forecast Horizon, then freely
+  // overridable per run from the selector on this page.
   const [forecastPeriod, setForecastPeriod] = useState<string>('30d')
+  const [aiEnabled, setAiEnabled] = useState(true)
+  const [aiConfidence, setAiConfidence] = useState(85)
   const [currentStock, setCurrentStock] = useState<number>(50)
   const [reorderLevel, setReorderLevel] = useState<number>(20)
   const [marketText, setMarketText] = useState<string>('')
@@ -104,6 +113,15 @@ export default function SalesForecast() {
   } | null>(null)
   const [accuracyState, setAccuracyState] = useState<'idle' | 'loading' | 'error'>('idle')
   const [accuracyError, setAccuracyError] = useState('')
+  // Why the model-status probe failed, so the card can say more than "unreachable".
+  const [modelStatusErr, setModelStatusErr] = useState('')
+  // The CURRENT market reading, decomposed. Distinct from dashStats.avgSentiment,
+  // which is the mean over stored past runs and cannot describe today.
+  const [market, setMarket] = useState<MarketInsight | null>(null)
+  const [marketErr, setMarketErr] = useState('')
+  // True while a sleeping Space is being woken — a materially different state
+  // from "working", and the one the user was actually stuck in.
+  const [backendWaking, setBackendWaking] = useState(false)
 
   // ----------------------------------------------------
   // INITIALIZATION & DATA FETCHING
@@ -115,6 +133,70 @@ export default function SalesForecast() {
     fetchDashboardIntelligence()
     fetchModelStatus()
     fetchModelAccuracy()
+    fetchMarketInsight()
+    fetchAiSettings()
+  }, [])
+
+  // The AI panel in Settings drives real behaviour here: whether predictions
+  // run at all, the default horizon sent to the model, and the confidence
+  // floor for turning a forecast into a restock suggestion.
+  //
+  // Compared against the measured out-of-sample accuracy, not a self-reported
+  // score: a model's own confidence says nothing about whether it is right.
+  const belowConfidence =
+    accuracy != null && accuracy.totalAccuracyPct < aiConfidence
+
+  async function fetchAiSettings() {
+    const { data } = await supabase
+      .from('app_settings')
+      .select('setting_key, setting_value')
+      .in('setting_key', ['ai_enabled', 'ai_forecast_period', 'ai_confidence'])
+    const get = (k: string) => (data || []).find((r: any) => r.setting_key === k)?.setting_value
+    setAiEnabled(get('ai_enabled') !== 'false')
+    setAiConfidence(parseInt(get('ai_confidence') ?? '85') || 85)
+    const period = get('ai_forecast_period')
+    if (period && ['7d', '30d', '90d', '365d'].includes(period)) setForecastPeriod(period)
+  }
+
+  // ── Keep the chart current ──────────────────────────────────────
+  // A new sale changes the actual line, and the forecast window is anchored to
+  // today, so a tab left open overnight would keep drawing yesterday's chart.
+  // Refresh on: a sales_transactions change, tab refocus, and the date rolling
+  // over. Events arrive in bursts during a batch, so refetches are debounced.
+  const salesRefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    const refresh = () => {
+      if (salesRefetchTimer.current) clearTimeout(salesRefetchTimer.current)
+      salesRefetchTimer.current = setTimeout(() => {
+        fetchSalesData()
+        fetchDashboardIntelligence()
+      }, 700)
+    }
+
+    const channel = supabase
+      .channel('forecast-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'sales_transactions' }, refresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory' }, refresh)
+      .subscribe()
+
+    let lastDay = new Date().toDateString()
+    const tick = setInterval(() => {
+      if (document.visibilityState !== 'visible') return
+      const nowDay = new Date().toDateString()
+      // Past midnight the forecast window itself moves, so rebuild everything.
+      if (nowDay !== lastDay) { lastDay = nowDay; fetchSalesData(); fetchModelAccuracy() }
+      else refresh()
+    }, 120_000)
+
+    const onVisible = () => { if (document.visibilityState === 'visible') refresh() }
+    document.addEventListener('visibilitychange', onVisible)
+
+    return () => {
+      if (salesRefetchTimer.current) clearTimeout(salesRefetchTimer.current)
+      clearInterval(tick)
+      document.removeEventListener('visibilitychange', onVisible)
+      supabase.removeChannel(channel)
+    }
   }, [])
 
   // Show auto-dismissing toast
@@ -198,13 +280,51 @@ export default function SalesForecast() {
   // Reports which model binaries actually loaded on the backend. Both loaders
   // fall back to a statistical policy on failure, so without this the UI would
   // keep claiming XGBoost/PPO for numbers those models never produced.
-  async function fetchModelStatus() {
-    const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
+  //
+  // Retries through a cold start: the Space sleeps, and a single failed probe
+  // used to leave the card reading "backend unreachable" for the rest of the
+  // session even once the server had come up.
+  /**
+   * Today's market conditions, straight from the source feeds.
+   *
+   * The dashboard used to headline the mean `sentiment_multiplier` across
+   * stored forecasts. 66 of 76 rows came from one batch run, so that figure
+   * was really "what the market looked like the day you pressed Run All",
+   * frozen. This asks what it looks like now.
+   */
+  async function fetchMarketInsight() {
+    setMarketErr('')
     try {
-      const res = await fetch(`${BACKEND_URL}/api/model-status`)
-      if (res.ok) setModelStatus(await res.json())
-    } catch {
+      // Same family/product basis the revenue-forecast endpoint scores its news
+      // on, so the headline multiplier and the adjustment applied to the chart
+      // are the same number. News is family-specific, so asking on a different
+      // family would put two different "market sentiment" figures on one page.
+      setMarket(await backendFetch<MarketInsight>('/api/market-insight?family=GROCERY%20I&product=retail', {
+        timeoutMs: 45_000, retries: 2, onRetry: () => setBackendWaking(true),
+      }))
+    } catch (err) {
+      setMarket(null)
+      setMarketErr(describeBackendError(err))
+    } finally {
+      setBackendWaking(false)
+    }
+  }
+
+  async function fetchModelStatus() {
+    setModelStatusErr('')
+    try {
+      const status = await backendFetch<ModelStatus>('/api/model-status', {
+        timeoutMs: 20_000,
+        retries: 3,
+        onRetry: () => setBackendWaking(true),
+      })
+      setModelStatus(status)
+      setModelStatusErr('')
+    } catch (err) {
       setModelStatus(null)
+      setModelStatusErr(describeBackendError(err))
+    } finally {
+      setBackendWaking(false)
     }
   }
 
@@ -257,8 +377,16 @@ export default function SalesForecast() {
    */
   async function fetchModelAccuracy() {
     setAccuracyState('loading'); setAccuracyError('')
-    const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
     try {
+      // Absorb a cold start on the cheap health route first. Two heavy
+      // backtest POSTs racing a booting Space is what used to hang here.
+      const awake = await wakeBackend({ onRetry: () => setBackendWaking(true) })
+      setBackendWaking(false)
+      if (!awake) {
+        setAccuracyError('Model server is not responding. It may be asleep or redeploying.')
+        setAccuracyState('error'); return
+      }
+
       const months = await completeSalesMonths()
       if (months.length < 2) {
         setAccuracyError('Needs two complete months of sales history to measure accuracy.')
@@ -277,22 +405,23 @@ export default function SalesForecast() {
         setAccuracyState('error'); return
       }
 
+      // Measured: 33 families x 31 days is ~23s per month on the free
+      // cpu-basic Space. The deadline is generous, but it IS a deadline.
       const runBacktest = async (start: string, days: number) => {
-        const res = await fetch(`${BACKEND_URL}/api/predict/backtest`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ start_date: start, days, families }),
-        })
-        if (!res.ok) throw new Error(`Backtest failed (${res.status})`)
-        const json = await res.json()
+        const json = await backendFetch<{ per_family: { family: string; predicted_total: number }[] }>(
+          '/api/predict/backtest',
+          { method: 'POST', body: { start_date: start, days, families }, timeoutMs: 90_000, retries: 1 },
+        )
         const m = new Map<string, number>()
         for (const f of json.per_family) m.set(f.family, Number(f.predicted_total) || 0)
         return m
       }
 
-      const [calibPred, holdPred] = await Promise.all([
-        runBacktest(calib.first, calib.days),
-        runBacktest(hold.first, hold.days),
-      ])
+      // Sequential, not Promise.all. The backend has ~2 shared vCPUs, so firing
+      // both months at once makes them contend and each takes roughly as long
+      // as the pair would sequentially — while burning both deadlines at once.
+      const calibPred = await runBacktest(calib.first, calib.days)
+      const holdPred = await runBacktest(hold.first, hold.days)
 
       const sum = (m: Map<string, number>) => Array.from(m.values()).reduce((a, b) => a + b, 0)
       const calibPredTotal = sum(calibPred)
@@ -331,8 +460,10 @@ export default function SalesForecast() {
       })
       setAccuracyState('idle')
     } catch (err: any) {
-      setAccuracyError(err?.message || 'Accuracy backtest failed.')
+      setAccuracyError(describeBackendError(err))
       setAccuracyState('error')
+    } finally {
+      setBackendWaking(false)
     }
   }
 
@@ -356,20 +487,17 @@ export default function SalesForecast() {
       // Call real AI revenue forecast endpoint
       const lastActual = chartData.length > 0 ? chartData[chartData.length - 1].actual : 0
       if (lastActual > 0) {
-        const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
         try {
-          const res = await fetch(`${BACKEND_URL}/api/predict/revenue-forecast`, {
+          const data = await backendFetch<any>('/api/predict/revenue-forecast', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+            timeoutMs: 45_000,
+            retries: 2,
+            body: {
               last_actual_revenue: lastActual,
               product_families: ['GROCERY I', 'BEVERAGES', 'DAIRY', 'PRODUCE', 'FROZEN FOODS'],
-            }),
+            },
           })
-          if (res.ok) {
-            const data = await res.json()
-            setRevenueForecast(data)
-          }
+          setRevenueForecast(data)
         } catch {
           // Backend not reachable — forecast lines will use sentiment-only fallback
         }
@@ -562,6 +690,12 @@ export default function SalesForecast() {
       setErrorToast('Please select a valid product first.')
       return
     }
+    // Settings > AI > Enable AI Predictions. The toggle previously wrote a
+    // value nothing read, so turning it off changed nothing.
+    if (!aiEnabled) {
+      setErrorToast('AI predictions are turned off in Settings → AI Settings.')
+      return
+    }
 
     // Parse comma-separated historical sales
     const salesArr = historicalSalesInput
@@ -578,13 +712,14 @@ export default function SalesForecast() {
     setPipelineResult(null)
     
     try {
-      const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
-      const response = await fetch(`${BACKEND_URL}/api/predict/pipeline`, {
+      // The pipeline also calls an LLM for sentiment, so it is the slowest
+      // route on the server — a long deadline, but still a deadline.
+      const data = await backendFetch<any>('/api/predict/pipeline', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
+        timeoutMs: 120_000,
+        retries: 1,
+        onRetry: () => setBackendWaking(true),
+        body: {
           product_id: String(selectedProductId),
           product_name: String(selectedProduct?.name || 'Unknown'),
           product_family: String(selectedProduct?.family || 'GROCERY I'),
@@ -592,20 +727,9 @@ export default function SalesForecast() {
           current_stock: Number(currentStock),
           reorder_level: Number(reorderLevel),
           market_text: marketText || '',
-          historical_sales: salesArr
-        })
+          historical_sales: salesArr,
+        },
       })
-
-      if (!response.ok) {
-        const errDetail = await response.json().catch(() => ({}))
-        const detail = errDetail.detail
-        const msg = Array.isArray(detail)
-          ? detail.map((e: any) => e.msg ?? JSON.stringify(e)).join(', ')
-          : typeof detail === 'string' ? detail : `Server error ${response.status}`
-        throw new Error(msg)
-      }
-
-      const data = await response.json()
       setPipelineResult(data)
       // Show auto-fetched news in the textarea so user can see what was used
       if (data.market_context_used && !marketText.trim()) {
@@ -617,10 +741,10 @@ export default function SalesForecast() {
 
     } catch (err: any) {
       console.error('Pipeline error:', err)
-      const msg = err instanceof Error ? err.message : JSON.stringify(err)
-      setErrorToast(`Pipeline failed: ${msg}`)
+      setErrorToast(`Pipeline failed: ${describeBackendError(err)}`)
     } finally {
       setSubmitting(false)
+      setBackendWaking(false)
     }
   }
 
@@ -687,7 +811,17 @@ export default function SalesForecast() {
     setBatchRunning(true)
     setBatchProgress({ done: 0, total: products.length, current: '', errors: 0 })
 
-    const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
+    // One wake before the loop. Without it a sleeping backend turned every
+    // product in the batch into its own stalled request.
+    setBackendWaking(true)
+    const awake = await wakeBackend()
+    setBackendWaking(false)
+    if (!awake) {
+      setBatchRunning(false)
+      setErrorToast('Model server is not responding — batch run cancelled.')
+      return
+    }
+
     let successCount = 0
     let errorCount = 0
     let skippedCount = 0
@@ -714,10 +848,11 @@ export default function SalesForecast() {
       }
 
       try {
-        const res = await fetch(`${BACKEND_URL}/api/predict/pipeline`, {
+        await backendFetch('/api/predict/pipeline', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+          timeoutMs: 120_000,
+          retries: 0,   // the batch is already long; a stuck product is skipped, not retried
+          body: {
             product_id: String(prod.id),
             product_name: String(prod.name),
             product_family: String(prod.family || 'GROCERY I'),
@@ -726,9 +861,9 @@ export default function SalesForecast() {
             reorder_level: Number(prod.reorder_level),
             market_text: '',
             historical_sales: salesArr,
-          }),
+          },
         })
-        res.ok ? successCount++ : errorCount++
+        successCount++
       } catch { errorCount++ }
     }
 
@@ -853,41 +988,93 @@ export default function SalesForecast() {
       ? productForecasts.reduce((s: number, f: any) => s + (parseFloat(f.sentiment_multiplier) || 1.0), 0) / productForecasts.length
       : 1.0)
 
-  // Historical rows — no forecast columns in actual months
-  const baseRows = predictionData.length > 0
-    ? predictionData.map((d: any) => ({ month: d.month, actual: d.actual, xgboost: null as number | null, adjusted: null as number | null }))
-    : []
+  const lastActualRevenue = predictionData.length > 0
+    ? predictionData[predictionData.length - 1].actual
+    : 0
 
-  const lastActualRevenue = baseRows.length > 0 ? baseRows[baseRows.length - 1].actual : 0
+  // The forecast window starts TODAY, not after the last month that happens to
+  // have sales in it. The backend runs the model over the 90 days from now, so
+  // labelling those three points as lastActualMonth+1..+3 named months the
+  // model never predicted — with data ending in June, a September forecast was
+  // being drawn as June, July, August.
+  const today = new Date()
+  const monthKey = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+  const forecastDates = [0, 1, 2].map(i => new Date(today.getFullYear(), today.getMonth() + i, 1))
 
-  // Anchor last actual point on both forecast lines for visual continuity
-  const actualRows = baseRows.map((d: any, i: number) => ({
-    ...d,
-    xgboost: i === baseRows.length - 1 ? d.actual : null,
-    adjusted: i === baseRows.length - 1 ? d.actual : null,
-  }))
-
-  const lastActualIdx = actualRows.length > 0
-    ? MONTHS.indexOf(actualRows[actualRows.length - 1].month)
-    : new Date().getMonth() - 1
-
-  // Build forecast rows: use REAL XGBoost seasonal output if available, else sentiment-only fallback
-  const forecastRows = [1, 2, 3].map(offset => {
+  const forecastByMonth = new Map<string, { xgboost: number; adjusted: number }>()
+  forecastDates.forEach((d, i) => {
     const xgboost = revenueForecast
-      ? revenueForecast.xgboost_monthly[offset - 1] ?? 0
-      : Math.round(lastActualRevenue * Math.pow(activeSentiment > 0 ? 1.015 : 1.0, offset))
+      ? revenueForecast.xgboost_monthly[i] ?? 0
+      : Math.round(lastActualRevenue * Math.pow(activeSentiment > 0 ? 1.015 : 1.0, i + 1))
     const adjusted = revenueForecast
-      ? revenueForecast.ppo_llm_monthly[offset - 1] ?? 0
+      ? revenueForecast.ppo_llm_monthly[i] ?? 0
       : Math.round(xgboost * activeSentiment)
+    forecastByMonth.set(monthKey(d), { xgboost, adjusted })
+  })
+
+  const actualByMonth = new Map<string, number>(
+    predictionData
+      .filter((d: any) => d.monthStart)
+      .map((d: any) => [d.monthStart.slice(0, 7), d.actual] as [string, number])
+  )
+
+  // Walk a continuous timeline from the first actual month to the last forecast
+  // month. Months with neither actuals nor a forecast stay null and render as a
+  // visible break — that gap is real (no sales were recorded) and hiding it by
+  // butting the two series together would imply continuity that does not exist.
+  const firstActual = predictionData.length > 0 && predictionData[0].monthStart
+    ? new Date(predictionData[0].monthStart + 'T00:00:00')
+    : forecastDates[0]
+  const lastForecast = forecastDates[forecastDates.length - 1]
+  const monthsBetween =
+    (lastForecast.getFullYear() - firstActual.getFullYear()) * 12 +
+    (lastForecast.getMonth() - firstActual.getMonth())
+
+  // Guard against a very stale dataset producing a chart that is mostly empty.
+  const spanCapped = monthsBetween > 14
+  const timelineStart = spanCapped
+    ? new Date(lastForecast.getFullYear(), lastForecast.getMonth() - 14, 1)
+    : firstActual
+  const steps = spanCapped ? 14 : monthsBetween
+
+  // When the actuals run right up to the forecast window, carry the last actual
+  // value onto both forecast lines so they start where the history ends instead
+  // of floating detached. Only when they are genuinely adjacent — bridging a
+  // real gap would draw months of continuity that never happened.
+  const lastActualKey = predictionData.length > 0 && predictionData[predictionData.length - 1].monthStart
+    ? predictionData[predictionData.length - 1].monthStart.slice(0, 7)
+    : null
+  const monthBeforeForecast = new Date(forecastDates[0].getFullYear(), forecastDates[0].getMonth() - 1, 1)
+  const forecastJoinsActuals = lastActualKey === monthKey(monthBeforeForecast)
+
+  const multiYear = timelineStart.getFullYear() !== lastForecast.getFullYear()
+  const combinedChartData = Array.from({ length: steps + 1 }, (_, i) => {
+    const d = new Date(timelineStart.getFullYear(), timelineStart.getMonth() + i, 1)
+    const k = monthKey(d)
+    const fc = forecastByMonth.get(k)
+    const actual = actualByMonth.has(k) ? (actualByMonth.get(k) as number) : null
+    const isJoin = forecastJoinsActuals && k === lastActualKey && actual !== null
     return {
-      month: MONTHS[(lastActualIdx + offset) % 12],
-      actual: null as number | null,
-      xgboost,
-      adjusted,
+      month: multiYear ? `${MONTHS[d.getMonth()]} '${String(d.getFullYear()).slice(2)}` : MONTHS[d.getMonth()],
+      actual,
+      xgboost: fc ? fc.xgboost : (isJoin ? actual : null),
+      adjusted: fc ? fc.adjusted : (isJoin ? actual : null),
     }
   })
 
-  const combinedChartData = [...actualRows, ...forecastRows]
+  const forecastRows = forecastDates.map((d, i) => ({
+    month: MONTHS[d.getMonth()],
+    ...(forecastByMonth.get(monthKey(d)) ?? { xgboost: 0, adjusted: 0 }),
+    _i: i,
+  }))
+
+  // How far behind the data is, so the chart can say so rather than look broken.
+  const lastActualDate = predictionData.length > 0 && predictionData[predictionData.length - 1].monthStart
+    ? new Date(predictionData[predictionData.length - 1].monthStart + 'T00:00:00')
+    : null
+  const staleMonths = lastActualDate
+    ? (today.getFullYear() - lastActualDate.getFullYear()) * 12 + (today.getMonth() - lastActualDate.getMonth()) - 1
+    : 0
 
   // Headline revenue reads off the same forecast the chart draws.
   const forecastRevenue3m = forecastRows.reduce((s, r) => s + (r.adjusted || 0), 0)
@@ -895,9 +1082,9 @@ export default function SalesForecast() {
     ? `${forecastRows[0].month}–${forecastRows[forecastRows.length - 1].month}`
     : ''
   const fmtMoney = (v: number) =>
-    v >= 1_000_000 ? `$${(v / 1_000_000).toFixed(1)}M`
-    : v >= 1_000 ? `$${(v / 1_000).toFixed(1)}K`
-    : `$${Math.round(v)}`
+    v >= 1_000_000 ? `${symbol}${(v / 1_000_000).toFixed(1)}M`
+    : v >= 1_000 ? `${symbol}${(v / 1_000).toFixed(1)}K`
+    : `${symbol}${Math.round(v)}`
 
   // Y-axis range: zoom in to the data range (±15%) so differences are visible
   const allValues = combinedChartData.flatMap(d => [d.actual, d.xgboost, d.adjusted].filter((v): v is number => v !== null && v > 0))
@@ -906,8 +1093,9 @@ export default function SalesForecast() {
 
   return (
     <div className="page-enter">
-      {/* Toast Notification Container */}
-      <div style={{ position: 'fixed', top: 20, right: 20, zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {/* Toast container — cleared below the top bar so it never lands on the
+          notification bell. */}
+      <div style={{ position: 'fixed', top: 'calc(var(--topbar-h) + 14px)', right: 20, zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 10 }}>
         {successToast && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px 20px', background: 'rgba(34, 211, 168, 0.95)', border: '1px solid rgba(255,255,255,0.2)', borderRadius: 12, color: '#031712', fontWeight: 600, boxShadow: '0 10px 30px rgba(34, 211, 168, 0.3)', animation: 'pageIn 0.2s ease-out' }}>
             <CheckCircle size={18} /> {successToast}
@@ -920,7 +1108,7 @@ export default function SalesForecast() {
         )}
       </div>
 
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', flexWrap: 'wrap', gap: 16 }}>
+      <div className="page-header page-header-row">
         <div>
           <h1>AI Forecasting & Decision Engine</h1>
           <p>Multi-agent forecasting pipeline merging XGBoost demand trends, LLM sentiment, and PPO Reinforcement Learning decisions.</p>
@@ -957,7 +1145,13 @@ export default function SalesForecast() {
           {/* ── STAT CARDS ── */}
           <div className="stat-grid">
             {(() => {
-              const sentColor = dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#00D4FF'
+              // Headline the LIVE reading, not the mean of past runs.
+              const liveMult = market?.multiplier ?? null
+              const sentColor = liveMult == null ? '#00D4FF'
+                : liveMult > 1.02 ? '#22d3a8' : liveMult < 0.98 ? '#f43f5e' : '#00D4FF'
+              const leadMover = market?.components
+                ?.slice()
+                .sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution))[0]
               const cards = [
                 {
                   // Same series the chart plots, so the headline figure and the
@@ -981,7 +1175,10 @@ export default function SalesForecast() {
                     : accuracy ? `${accuracy.totalAccuracyPct.toFixed(1)}%` : '—',
                   sub: accuracy
                     ? `${accuracy.holdoutLabel} held out · calibrated on ${accuracy.calibrationLabel}`
-                    : accuracyState === 'loading' ? 'Running holdout backtest…'
+                    // "Waking" and "working" looked identical before, which is
+                    // why a 60s cold start read as a frozen card.
+                    : accuracyState === 'loading'
+                      ? (backendWaking ? 'Waking the model server…' : 'Running holdout backtest…')
                     : accuracyError || 'Backtest unavailable',
                   valueColor: accuracy
                     ? (accuracy.totalAccuracyPct >= 90 ? '#22d3a8' : accuracy.totalAccuracyPct >= 70 ? '#f59e0b' : '#f43f5e')
@@ -990,9 +1187,16 @@ export default function SalesForecast() {
                 {
                   id: 'sentiment', color: sentColor,
                   icon: <Activity size={18} color={sentColor} />,
-                  label: 'Avg Market Sentiment',
-                  value: dashLoading ? '...' : `x${dashStats.avgSentiment.toFixed(3)}`,
-                  sub: dashStats.avgSentiment > 1.02 ? 'Market trending UP' : dashStats.avgSentiment < 0.98 ? 'Market trending DOWN' : 'Neutral baseline',
+                  label: 'Market Sentiment · Live',
+                  value: liveMult == null ? (marketErr ? '—' : '...') : `x${liveMult.toFixed(3)}`,
+                  // Name the driver instead of restating the direction. "Market
+                  // trending DOWN" told you nothing you couldn't read off the
+                  // number; which input moved it is the actual insight.
+                  sub: liveMult == null
+                    ? (marketErr || 'Reading live market conditions…')
+                    : leadMover && Math.abs(leadMover.contribution) >= 0.005
+                      ? `${leadMover.contribution > 0 ? '▲' : '▼'} ${leadMover.label} ${leadMover.contribution > 0 ? '+' : ''}${(leadMover.contribution * 100).toFixed(1)}%`
+                      : 'All inputs at baseline',
                   valueColor: sentColor,
                 },
                 {
@@ -1044,6 +1248,18 @@ export default function SalesForecast() {
                   </span>
                 )}
               </div>
+              {/* The forecast window is anchored to today. Say where the actuals
+                  stop, so a gap in the line reads as missing data rather than a
+                  crash in sales. */}
+              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginTop: -4, marginBottom: 8 }}>
+                Forecast {forecastRows.length > 0 ? `${forecastRows[0].month}–${forecastRows[forecastRows.length - 1].month} ${today.getFullYear()}` : ''} (next 90 days from today)
+                {staleMonths > 0 && (
+                  <span style={{ color: '#f59e0b' }}>
+                    {' · '}sales data ends {lastActualDate ? `${MONTHS[lastActualDate.getMonth()]} ${lastActualDate.getFullYear()}` : ''}
+                    , so {staleMonths} month{staleMonths !== 1 ? 's' : ''} of the timeline have no recorded sales
+                  </span>
+                )}
+              </div>
               <div className="chart-wrapper-lg">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={combinedChartData}>
@@ -1053,14 +1269,14 @@ export default function SalesForecast() {
                       domain={[yMin, yMax]}
                       tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }}
                       axisLine={false} tickLine={false}
-                      tickFormatter={v => `$${(v / 1_000_000).toFixed(1)}M`}
+                      tickFormatter={v => `${symbol}${(v / 1_000_000).toFixed(1)}M`}
                     />
                     <Tooltip
                       cursor={{ stroke: 'rgba(255,255,255,0.1)' }}
                       contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }}
                       labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }}
                       itemStyle={{ fontSize: 12, fontWeight: 600 }}
-                      formatter={(value: number) => [`$${(value / 1_000_000).toFixed(2)}M`, undefined]}
+                      formatter={(value: number) => [`${symbol}${(value / 1_000_000).toFixed(2)}M`, undefined]}
                     />
                     <Legend wrapperStyle={{ fontSize: 12, color: 'rgba(255,255,255,0.5)' }} />
                     <ReferenceLine x={currentMonthName} stroke="rgba(255,255,255,0.35)" strokeDasharray="4 2"
@@ -1098,7 +1314,7 @@ export default function SalesForecast() {
                       border: '1px solid rgba(255,255,255,0.15)',
                     }}
                   >
-                    {accuracyState === 'loading' ? 'measuring…'
+                    {accuracyState === 'loading' ? (backendWaking ? 'waking…' : 'measuring…')
                       : accuracy ? `${accuracy.totalAccuracyPct.toFixed(1)}% accurate` : 'not measured'}
                   </span>
                 </div>
@@ -1109,12 +1325,28 @@ export default function SalesForecast() {
                     silently, so "XGBoost" is a claim until the backend confirms it. */}
                 <div style={{ fontSize: 11, marginBottom: 8, color: modelStatus
                   ? (modelStatus.xgboost?.loaded ? '#22d3a8' : '#f43f5e')
-                  : 'var(--clr-text-muted)' }}>
+                  : backendWaking ? '#f59e0b' : 'var(--clr-text-muted)' }}>
                   {modelStatus
                     ? (modelStatus.xgboost?.loaded
                         ? '● Model binary loaded — predictions are XGBoost'
                         : `● Model NOT loaded — serving ${modelStatus.xgboost?.engine}`)
-                    : '○ Engine unconfirmed (backend unreachable)'}
+                    : backendWaking
+                      ? '◌ Waking the model server (it sleeps when idle)…'
+                      : `○ Engine unconfirmed — ${modelStatusErr || 'backend unreachable'}`}
+                  {!modelStatus && !backendWaking && (
+                    // A dead card with no way to retry meant a page reload was
+                    // the only recovery once the server came back.
+                    <button
+                      onClick={e => { e.stopPropagation(); fetchModelStatus(); fetchModelAccuracy() }}
+                      style={{
+                        marginLeft: 8, padding: '2px 8px', fontSize: 10, fontWeight: 600,
+                        borderRadius: 6, cursor: 'pointer', color: '#6C63FF',
+                        background: 'rgba(108,99,255,0.14)', border: '1px solid rgba(108,99,255,0.4)',
+                      }}
+                    >
+                      Retry
+                    </button>
+                  )}
                 </div>
                 {accuracy && (
                   <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginBottom: 8 }}>
@@ -1138,17 +1370,39 @@ export default function SalesForecast() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, fontSize: 13, color: '#00D4FF' }}>
                     <Zap size={14} /> LLM Market Sentiment
                   </div>
-                  <span style={{ fontWeight: 800, fontSize: 14, color: dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#fff' }}>
-                    x{dashStats.avgSentiment.toFixed(3)}
+                  <span style={{ fontWeight: 800, fontSize: 14, color: market
+                    ? (market.multiplier > 1.02 ? '#22d3a8' : market.multiplier < 0.98 ? '#f43f5e' : '#fff')
+                    : 'rgba(255,255,255,0.5)' }}>
+                    {market ? `x${market.multiplier.toFixed(3)}` : '—'}
                   </span>
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginBottom: 8 }}>
-                  GPT-4o-mini • Live oil price (WTI) + holidays + NewsAPI
+                  {market
+                    ? `WTI $${market.oil.price.toFixed(2)} · ${market.holidays.length} holiday${market.holidays.length === 1 ? '' : 's'} · ${market.headlines.length} headline${market.headlines.length === 1 ? '' : 's'}`
+                    : 'Live oil (WTI) + holidays + NewsAPI'}
                 </div>
+                {/* Each input's share of the multiplier, so the number is
+                    traceable to its evidence rather than asserted. */}
+                {market && (
+                  <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+                    {market.components.map(c => {
+                      const pct = Math.abs(c.contribution) * 100
+                      const tone = c.contribution > 0.001 ? '#22d3a8' : c.contribution < -0.001 ? '#f43f5e' : 'rgba(255,255,255,0.25)'
+                      return (
+                        <div key={c.label} style={{ flex: 1, textAlign: 'center' }} title={c.detail}>
+                          <div style={{ height: 3, borderRadius: 2, background: tone, opacity: pct > 0.1 ? 1 : 0.3, marginBottom: 4 }} />
+                          <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {c.label.split(' ')[0]} {c.contribution >= 0 ? '+' : ''}{(c.contribution * 100).toFixed(1)}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
                 <div className="progress-bar">
                   <div className="progress-fill" style={{
-                    width: `${Math.min(100, Math.max(0, ((dashStats.avgSentiment - 0.70) / 0.60) * 100))}%`,
-                    background: dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#00D4FF'
+                    width: `${Math.min(100, Math.max(0, (((market?.multiplier ?? 1) - 0.70) / 0.60) * 100))}%`,
+                    background: market && market.multiplier > 1.02 ? '#22d3a8' : market && market.multiplier < 0.98 ? '#f43f5e' : '#00D4FF'
                   }} />
                 </div>
               </div>
@@ -1894,10 +2148,19 @@ export default function SalesForecast() {
                         </span>
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>
-                        {pipelineResult.optimal_reorder_qty > 0 
-                          ? `Order suggested to prevent ${forecastPeriod} depletion` 
+                        {pipelineResult.optimal_reorder_qty > 0
+                          ? `Order suggested to prevent ${forecastPeriod} depletion`
                           : 'Inventory level optimal. No purchase required.'}
                       </div>
+                      {/* Confidence Threshold from Settings, applied against the
+                          MEASURED out-of-sample accuracy rather than a number the
+                          model asserts about itself. Below the floor the number is
+                          still shown — it is just not put forward as an action. */}
+                      {belowConfidence && pipelineResult.optimal_reorder_qty > 0 && (
+                        <div style={{ fontSize: 11, color: '#f59e0b', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', borderRadius: 8, padding: '8px 10px' }}>
+                          Advisory only — measured accuracy {accuracy!.totalAccuracyPct.toFixed(1)}% is below your {aiConfidence}% confidence threshold, so this is not raised as an automatic restock suggestion.
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -2085,7 +2348,7 @@ export default function SalesForecast() {
                           </strong>
                         </td>
                         <td style={{ color: 'var(--clr-text-muted)', fontSize: 11 }}>
-                          {new Date(row.predicted_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+                          {fmtDateTime(row.predicted_at)}
                         </td>
                         <td>
                           <div style={{ display: 'flex', gap: 6 }}>
@@ -2278,7 +2541,7 @@ export default function SalesForecast() {
               {[
                 { label: 'XGBoost Demand', value: `${selectedAction.total_forecasted_demand} units`, sub: `over ${selectedAction.forecast_period}`, color: '#a78bfa' },
                 { label: 'Daily Rate', value: `${selectedAction.daily_demand}/day`, sub: 'avg demand', color: '#00D4FF' },
-                { label: 'Forecasted Revenue', value: `$${(selectedAction.forecasted_revenue || 0).toLocaleString()}`, sub: `${selectedAction.forecast_period} outlook`, color: '#22d3a8' },
+                { label: 'Forecasted Revenue', value: `${symbol}${(selectedAction.forecasted_revenue || 0).toLocaleString()}`, sub: `${selectedAction.forecast_period} outlook`, color: '#22d3a8' },
               ].map(t => (
                 <div key={t.label} style={{ flex: '1 1 130px', padding: '13px 15px', borderRadius: 12, background: `${t.color}0d`, border: `1px solid ${t.color}30` }}>
                   <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{t.label}</div>
@@ -2634,9 +2897,139 @@ export default function SalesForecast() {
             {/* ── SENTIMENT MODAL ── */}
             {statCardModal === 'sentiment' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+
+                {/* ── Live reading, decomposed ───────────────────────────── */}
+                {marketErr && (
+                  <div style={{ padding: 14, borderRadius: 10, background: 'rgba(244,63,94,0.08)', border: '1px solid rgba(244,63,94,0.3)', color: '#f43f5e', fontSize: 12.5 }}>
+                    {marketErr}
+                    <button onClick={() => fetchMarketInsight()} style={{ marginLeft: 10, padding: '3px 10px', fontSize: 11, fontWeight: 600, borderRadius: 6, cursor: 'pointer', color: '#6C63FF', background: 'rgba(108,99,255,0.14)', border: '1px solid rgba(108,99,255,0.4)' }}>Retry</button>
+                  </div>
+                )}
+
+                {market && (() => {
+                  const tone = market.multiplier > 1.02 ? '#22d3a8' : market.multiplier < 0.98 ? '#f43f5e' : '#00D4FF'
+                  return (
+                    <div style={{ padding: 18, borderRadius: 14, background: `${tone}0d`, border: `1px solid ${tone}38` }}>
+                      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
+                        <span style={{ fontSize: 34, fontWeight: 800, color: tone, lineHeight: 1 }}>
+                          x{market.multiplier.toFixed(3)}
+                        </span>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: tone }}>{market.direction}</span>
+                        <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginLeft: 'auto' }}>
+                          live · {fmtDateTime(market.generated_at)}
+                        </span>
+                      </div>
+
+                      {/* Baseline + each contribution, so the total is checkable. */}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11.5, color: 'rgba(255,255,255,0.4)' }}>
+                          <span>Baseline</span><span>1.000</span>
+                        </div>
+                        {market.components.map(c => {
+                          const ctone = c.contribution > 0.001 ? '#22d3a8' : c.contribution < -0.001 ? '#f43f5e' : 'rgba(255,255,255,0.35)'
+                          return (
+                            <div key={c.label} style={{ padding: '9px 12px', borderRadius: 9, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+                                <span style={{ fontSize: 12.5, fontWeight: 600, color: '#fff' }}>{c.label}</span>
+                                <span style={{ fontSize: 13, fontWeight: 800, color: ctone, fontVariantNumeric: 'tabular-nums' }}>
+                                  {c.contribution >= 0 ? '+' : ''}{c.contribution.toFixed(4)}
+                                </span>
+                              </div>
+                              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', lineHeight: 1.55 }}>{c.detail}</div>
+                            </div>
+                          )
+                        })}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, fontWeight: 700, color: '#fff', paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+                          <span>Net adjustment</span>
+                          <span style={{ color: tone, fontVariantNumeric: 'tabular-nums' }}>
+                            {market.total_adjustment >= 0 ? '+' : ''}{market.total_adjustment.toFixed(4)} → x{market.multiplier.toFixed(3)}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* ── Oil, with the context that makes the level readable ── */}
+                {market && (
+                  <div style={{ padding: 14, borderRadius: 12, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 10 }}>
+                      Crude oil (WTI) · {market.oil.source}
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))', gap: 10 }}>
+                      {[
+                        { k: 'Now', v: `$${market.oil.price.toFixed(2)}`, c: '#fff' },
+                        { k: '90-day avg', v: `$${market.oil.avg_90d.toFixed(2)}`, c: 'rgba(255,255,255,0.65)' },
+                        { k: 'vs average', v: `${market.oil.pct_vs_avg >= 0 ? '+' : ''}${market.oil.pct_vs_avg.toFixed(1)}%`, c: market.oil.pct_vs_avg > 0 ? '#f43f5e' : '#22d3a8' },
+                        { k: '30-day move', v: `${market.oil.pct_30d >= 0 ? '+' : ''}${market.oil.pct_30d.toFixed(1)}%`, c: market.oil.pct_30d > 0 ? '#f43f5e' : '#22d3a8' },
+                        { k: '6-month range', v: `$${market.oil.low_6mo.toFixed(0)}–$${market.oil.high_6mo.toFixed(0)}`, c: 'rgba(255,255,255,0.65)' },
+                      ].map(s => (
+                        <div key={s.k}>
+                          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.38)', marginBottom: 3 }}>{s.k}</div>
+                          <div style={{ fontSize: 15, fontWeight: 800, color: s.c, fontVariantNumeric: 'tabular-nums' }}>{s.v}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ── Holidays actually relevant to this business ─────────── */}
+                {market && market.holidays.length > 0 && (
+                  <div style={{ padding: 14, borderRadius: 12, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 10 }}>
+                      Upcoming holidays · next 60 days
+                    </div>
+                    {market.holidays.slice(0, 5).map((h, i) => (
+                      <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '6px 0', borderTop: i ? '1px solid rgba(255,255,255,0.05)' : 'none' }}>
+                        <div>
+                          <div style={{ fontSize: 12.5, color: '#fff', fontWeight: 600 }}>{h.name}</div>
+                          <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.35)' }}>
+                            {h.date} · {h.country}{h.scope ? ` · ${h.scope}` : ''}
+                          </div>
+                        </div>
+                        <span style={{ fontSize: 12, fontWeight: 700, color: h.days_until <= 14 ? '#22d3a8' : 'rgba(255,255,255,0.55)', whiteSpace: 'nowrap' }}>
+                          in {h.days_until}d
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* ── The actual articles the news score came from ────────── */}
+                {market && (
+                  <div style={{ padding: 14, borderRadius: 12, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 10 }}>
+                      Headlines scored · {market.news_engine === 'gpt-4o-mini' ? 'GPT-4o-mini' : market.news_engine}
+                    </div>
+                    {market.headlines.length === 0 ? (
+                      <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>
+                        No headlines retrieved ({market.news_status}). Oil and holidays still scored.
+                      </div>
+                    ) : market.headlines.map((h, i) => (
+                      <a
+                        key={i} href={h.url} target="_blank" rel="noopener noreferrer"
+                        style={{ display: 'block', padding: '7px 0', textDecoration: 'none', borderTop: i ? '1px solid rgba(255,255,255,0.05)' : 'none' }}
+                      >
+                        <div style={{ fontSize: 12, color: '#fff', lineHeight: 1.45 }}>{h.title}</div>
+                        <div style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.35)', marginTop: 2 }}>
+                          {h.source}{h.published_at ? ` · ${fmtDateTime(h.published_at)}` : ''}
+                        </div>
+                      </a>
+                    ))}
+                  </div>
+                )}
+
+                {/* ── Stored history, labelled for what it is ─────────────── */}
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: 1, marginTop: 6 }}>
+                  Recorded in past pipeline runs
+                </div>
+                <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)', marginTop: -4, marginBottom: 2, lineHeight: 1.5 }}>
+                  The average below is over stored runs, not over time — a batch of 60 products in
+                  one afternoon counts 60 times. It describes what the model said, not the market.
+                </div>
                 <div style={{ display: 'flex', gap: 12, marginBottom: 4 }}>
                   {[
-                    { label: 'Average', value: `x${dashStats.avgSentiment.toFixed(3)}`, color: dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#00D4FF' },
+                    { label: 'Avg of runs', value: `x${dashStats.avgSentiment.toFixed(3)}`, color: dashStats.avgSentiment > 1.02 ? '#22d3a8' : dashStats.avgSentiment < 0.98 ? '#f43f5e' : '#00D4FF' },
                     { label: 'Positive', value: productForecasts.filter((f:any) => parseFloat(f.sentiment_multiplier) > 1.02).length, color: '#22d3a8' },
                     { label: 'Neutral', value: productForecasts.filter((f:any) => parseFloat(f.sentiment_multiplier) >= 0.98 && parseFloat(f.sentiment_multiplier) <= 1.02).length, color: '#fff' },
                     { label: 'Negative', value: productForecasts.filter((f:any) => parseFloat(f.sentiment_multiplier) < 0.98).length, color: '#f43f5e' },
@@ -2701,7 +3094,7 @@ export default function SalesForecast() {
                   >
                     <div style={{ flex: 1 }}>
                       <div style={{ fontWeight: 600, fontSize: 13, color: '#fff' }}>{f.product_name}</div>
-                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)' }}>{new Date(f.predicted_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</div>
+                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)' }}>{fmtDateTime(f.predicted_at)}</div>
                     </div>
                     <span className="badge badge-accent" style={{ fontSize: 10 }}>{f.forecast_period}</span>
                     <span style={{ fontWeight: 700, fontSize: 13, color: parseFloat(f.sentiment_multiplier) > 1.02 ? '#22d3a8' : parseFloat(f.sentiment_multiplier) < 0.98 ? '#f43f5e' : '#fff' }}>

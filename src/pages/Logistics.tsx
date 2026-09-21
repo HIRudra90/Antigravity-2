@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '../lib/supabaseClient'
+import { useLiveData } from '../lib/useLiveData'
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid, PieChart, Pie, Cell, Sector,
@@ -204,7 +205,14 @@ function NewShipmentModal({ customerId, onClose, onBooked }: {
       const consignmentNo = o?.consignmentNo || o?.consignment_no || String(orderId)
       const statusCode = o?.statusCode ?? 200
 
-      await supabase.from('shipments').insert({
+      // The courier order exists at this point — real money, real pickup. If
+      // saving it locally fails we must say so loudly and keep the order id on
+      // screen, because the shipment is already booked and this record is the
+      // only thing tying it back to the business. The previous version ignored
+      // this error and reported "Booked!" regardless, which is how an RLS
+      // rejection turned into shipments that existed at Delyva and nowhere
+      // else (fixed in migration 032).
+      const { error: saveErr } = await supabase.from('shipments').insert({
         delyva_order_id: String(orderId),
         tracking_no: trackingNo,
         consignment_no: consignmentNo,
@@ -224,6 +232,18 @@ function NewShipmentModal({ customerId, onClose, onBooked }: {
         status_code: statusCode,
       })
 
+      if (saveErr) {
+        console.error('shipment save failed:', saveErr)
+        setErr(
+          `The courier booked this shipment (Order ID: ${orderId}` +
+          `${trackingNo !== String(orderId) ? `, Tracking: ${trackingNo}` : ''}) ` +
+          `but it could not be saved here: ${saveErr.message}. ` +
+          `Write that order ID down — the pickup is scheduled, but this record is missing.`
+        )
+        setBusy(false)
+        return
+      }
+
       setOk(`Booked! Order ID: ${orderId}${trackingNo !== String(orderId) ? ` · Tracking: ${trackingNo}` : ''}`)
       setTimeout(() => onBooked(), 3000)
     } catch (e: any) {
@@ -232,10 +252,38 @@ function NewShipmentModal({ customerId, onClose, onBooked }: {
     setBusy(false)
   }
 
-  const field = (label: string, k: keyof typeof blank, opts?: { type?: string; placeholder?: string; col?: string }) => (
-    <div style={opts?.col ? { gridColumn: opts.col } : {}}>
-      <label style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>{label}</label>
-      <input className="form-input" type={opts?.type || 'text'} value={form[k]} onChange={set(k)} placeholder={opts?.placeholder} />
+  // One field = label stacked above its control, so nothing sits inline and
+  // every column lines up regardless of label length.
+  const field = (
+    label: string,
+    k: keyof typeof blank,
+    opts?: { type?: string; placeholder?: string; span?: boolean; required?: boolean }
+  ) => (
+    <div className={`form-group${opts?.span ? ' span-2' : ''}`}>
+      <label className="form-label">
+        {label}{opts?.required && <span className="req">*</span>}
+      </label>
+      <input
+        className="form-input"
+        type={opts?.type || 'text'}
+        value={form[k]}
+        onChange={set(k)}
+        placeholder={opts?.placeholder}
+      />
+    </div>
+  )
+
+  const selectField = (
+    label: string,
+    k: keyof typeof blank,
+    children: React.ReactNode,
+    opts?: { required?: boolean }
+  ) => (
+    <div className="form-group">
+      <label className="form-label">
+        {label}{opts?.required && <span className="req">*</span>}
+      </label>
+      <select className="form-input" value={form[k]} onChange={set(k)}>{children}</select>
     </div>
   )
 
@@ -252,13 +300,17 @@ function NewShipmentModal({ customerId, onClose, onBooked }: {
 
         {step === 'form' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-            {/* Inventory / Warehouse */}
-            <div>
-              <label style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>
-                Delyva Warehouse / Inventory ID *
-                <a href="https://my.delyva.app/customer/inventory" target="_blank" rel="noopener noreferrer"
-                  style={{ marginLeft: 8, color: '#6C63FF', fontSize: 11 }}>Find yours →</a>
-              </label>
+            {/* Warehouse — the one field that gates everything below it */}
+            <div className="form-section">
+              <div className="form-section-title">
+                <span className="step-dot">1</span> Pickup warehouse
+              </div>
+              <div className="form-group">
+                <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}>
+                  <span>Delyva warehouse / inventory ID<span className="req">*</span></span>
+                  <a href="https://my.delyva.app/customer/inventory" target="_blank" rel="noopener noreferrer"
+                    style={{ color: '#6C63FF', fontSize: 11, whiteSpace: 'nowrap' }}>Find yours →</a>
+                </label>
               {inventories.length > 0 ? (
                 <select className="form-input" value={inventoryId ?? ''} onChange={e => {
                   const id = Number(e.target.value)
@@ -289,68 +341,68 @@ function NewShipmentModal({ customerId, onClose, onBooked }: {
                   }}
                 />
               )}
+              <span className="form-hint">Selecting a warehouse fills the sender details below.</span>
+              </div>
             </div>
 
             {/* Sender */}
-            <div>
-              <p style={{ fontSize: 12, fontWeight: 700, color: 'var(--clr-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>Sender / Pickup *</p>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                {field('Sender Name *', 'oName', { placeholder: 'Inventiq Warehouse' })}
-                {field('Sender Phone *', 'oPhone', { placeholder: '+601x-xxxxxxx' })}
-                {field('Pickup Address *', 'oAddress', { col: '1/-1', placeholder: 'Street address' })}
-                {field('City *', 'oCity', { placeholder: 'Kuala Lumpur' })}
-                {field('Postcode *', 'oPostcode', { placeholder: '50000' })}
-                <div>
-                  <label style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>State</label>
-                  <select className="form-input" value={form.oState} onChange={set('oState')}>
-                    {MY_STATES.map(s => <option key={s}>{s}</option>)}
-                  </select>
-                </div>
+            <div className="form-section">
+              <div className="form-section-title">
+                <span className="step-dot">2</span> Sender · pickup from
+              </div>
+              <div className="form-grid">
+                {field('Sender name', 'oName', { placeholder: 'Inventiq Warehouse', required: true })}
+                {field('Sender phone', 'oPhone', { placeholder: '+601x-xxxxxxx', required: true })}
+                {field('Pickup address', 'oAddress', { span: true, placeholder: 'Street address', required: true })}
+                {field('City', 'oCity', { placeholder: 'Kuala Lumpur', required: true })}
+                {field('Postcode', 'oPostcode', { placeholder: '50000', required: true })}
+                {selectField('State', 'oState', MY_STATES.map(s => <option key={s}>{s}</option>), { required: true })}
               </div>
             </div>
 
             {/* Recipient */}
-            <div>
-              <p style={{ fontSize: 12, fontWeight: 700, color: 'var(--clr-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>Recipient / Delivery *</p>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                {field('Recipient Name *', 'rName', { placeholder: 'Customer name' })}
-                {field('Phone *', 'rPhone', { placeholder: '+601x-xxxxxxx' })}
-                {field('Delivery Address *', 'rAddress', { col: '1/-1', placeholder: 'Street address' })}
-                {field('City *', 'rCity', { placeholder: 'Petaling Jaya' })}
-                {field('Postcode *', 'rPostcode', { placeholder: '47301' })}
-                <div>
-                  <label style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>State</label>
-                  <select className="form-input" value={form.rState} onChange={set('rState')}>
-                    {MY_STATES.map(s => <option key={s}>{s}</option>)}
-                  </select>
-                </div>
+            <div className="form-section">
+              <div className="form-section-title">
+                <span className="step-dot">3</span> Recipient · deliver to
+              </div>
+              <div className="form-grid">
+                {field('Recipient name', 'rName', { placeholder: 'Customer name', required: true })}
+                {field('Recipient phone', 'rPhone', { placeholder: '+601x-xxxxxxx', required: true })}
+                {field('Delivery address', 'rAddress', { span: true, placeholder: 'Street address', required: true })}
+                {field('City', 'rCity', { placeholder: 'Petaling Jaya', required: true })}
+                {field('Postcode', 'rPostcode', { placeholder: '47301', required: true })}
+                {selectField('State', 'rState', MY_STATES.map(s => <option key={s}>{s}</option>), { required: true })}
               </div>
             </div>
 
             {/* Parcel */}
-            <div>
-              <p style={{ fontSize: 12, fontWeight: 700, color: 'var(--clr-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>Parcel Details</p>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                {field('Weight (kg) *', 'weight', { type: 'number', placeholder: '1' })}
-                <div>
-                  <label style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>Item Type</label>
-                  <select className="form-input" value={form.itemType} onChange={set('itemType')}>
+            <div className="form-section">
+              <div className="form-section-title">
+                <span className="step-dot">4</span> Parcel
+              </div>
+              <div className="form-grid">
+                {field('Weight (kg)', 'weight', { type: 'number', placeholder: '1', required: true })}
+                {selectField('Item type', 'itemType', (
+                  <>
                     <option value="PARCEL">Parcel</option>
                     <option value="DOCUMENT">Document</option>
                     <option value="FOOD">Food</option>
                     <option value="FRAGILE">Fragile</option>
-                  </select>
-                </div>
-                <div style={{ gridColumn: '1/-1' }}>
-                  <label style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>Notes</label>
-                  <textarea className="form-input" value={form.notes} onChange={set('notes')} placeholder="Special instructions..." rows={2} style={{ resize: 'none' }} />
+                  </>
+                ))}
+                <div className="form-group span-2">
+                  <label className="form-label">Notes <span style={{ color: 'var(--clr-text-dim)' }}>(optional)</span></label>
+                  <textarea className="form-input" value={form.notes} onChange={set('notes')} placeholder="Special instructions for the courier…" rows={2} />
                 </div>
               </div>
             </div>
 
-            <button className="btn btn-primary" onClick={getQuotes} disabled={busy}>
+            <button className="btn btn-primary" onClick={getQuotes} disabled={busy} style={{ width: '100%', justifyContent: 'center', padding: '12px 0' }}>
               {busy ? 'Getting quotes…' : 'Get Courier Quotes'}
             </button>
+            <p style={{ fontSize: 11, color: 'var(--clr-text-dim)', textAlign: 'center', marginTop: -8 }}>
+              Nothing is booked yet — you'll pick a courier and price on the next step.
+            </p>
           </div>
         )}
 
@@ -563,10 +615,21 @@ export default function Logistics() {
 
   useEffect(() => { fetchAll() }, [])
 
-  async function fetchAll() {
-    setLoading(true)
+  // Every other page follows its table live; this one only refreshed after its
+  // own booking modal closed, so a shipment recorded anywhere else — another
+  // tab, the tracking refresh, a direct write — left these cards stale until a
+  // manual reload. `silent` keeps the cards from flashing "…" on each event.
+  useLiveData('logistics-live', ['shipments'], () => fetchAll({ silent: true }))
+
+  async function fetchAll({ silent = false }: { silent?: boolean } = {}) {
+    if (!silent) setLoading(true)
     fetchCustomerId()
-    const { data } = await supabase.from('shipments').select('*').order('created_at', { ascending: false })
+    const { data, error } = await supabase.from('shipments').select('*').order('created_at', { ascending: false })
+    // An RLS denial returns zero rows and no error, so a silent empty result
+    // is indistinguishable from "no shipments yet" — which is exactly how the
+    // missing `authenticated` policy hid for so long. A genuine error at least
+    // reaches the console rather than rendering as a confident 0.
+    if (error) console.error('shipments fetch failed:', error)
     setShipments((data as Shipment[]) || [])
     setLoading(false)
   }
@@ -586,13 +649,13 @@ export default function Logistics() {
 
   return (
     <div className="page-enter">
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div className="page-header page-header-row">
         <div>
           <h1>Logistics</h1>
           <p>Book shipments via Delyva — compare courier rates, track deliveries in real-time</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-ghost btn-sm" onClick={fetchAll}><RefreshCw size={14} /></button>
+          <button className="btn btn-ghost btn-sm" onClick={() => fetchAll()}><RefreshCw size={14} /></button>
           <button className="btn btn-primary btn-sm" onClick={() => setShowNew(true)}><Plus size={14} /> New Shipment</button>
         </div>
       </div>
@@ -849,7 +912,7 @@ export default function Logistics() {
         <div className="glass-card">
           <div className="section-title">
             All Shipments ({shipments.length})
-            <button className="btn btn-ghost btn-sm" onClick={fetchAll}><RefreshCw size={13} /></button>
+            <button className="btn btn-ghost btn-sm" onClick={() => fetchAll()}><RefreshCw size={13} /></button>
           </div>
           {shipments.length === 0 ? (
             <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--clr-text-muted)' }}>

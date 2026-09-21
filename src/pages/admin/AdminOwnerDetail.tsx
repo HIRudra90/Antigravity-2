@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, Search, ShoppingCart, RefreshCw, AlertCircle,
-  CheckCircle2, Layers, Package, Loader2,
+  CheckCircle2, Layers, Package, Loader2, CreditCard, ShoppingBag, X,
 } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
+import { useLiveData } from '../../lib/useLiveData'
 
 interface ProductRow {
   id: number
@@ -47,8 +49,17 @@ export default function AdminOwnerDetail() {
   const [placing, setPlacing] = useState(false)
   const [toast, setToast] = useState<{ type: 'ok' | 'err'; text: string } | null>(null)
 
-  async function fetchAll() {
-    setLoading(true)
+  // Buy-everything confirm. The totals shown here come from the server, not
+  // from `products` above — the page's copy can be seconds stale, and this
+  // write is far too large to confirm against a guess.
+  const [bulkOpen, setBulkOpen] = useState(false)
+  const [bulkPreview, setBulkPreview] = useState<{ product_count: number; total_units: number; total_amount: number } | null>(null)
+  const [bulkLoading, setBulkLoading] = useState(false)
+  const [bulkRunning, setBulkRunning] = useState(false)
+  const [bulkErr, setBulkErr] = useState<string | null>(null)
+
+  async function fetchAll({ silent = false }: { silent?: boolean } = {}) {
+    if (!silent) setLoading(true)
     setError(null)
     try {
       const [ownerRes, prodRes, invRes, orderRes] = await Promise.all([
@@ -87,10 +98,24 @@ export default function AdminOwnerDetail() {
 
   useEffect(() => { if (ownerId) fetchAll() }, [ownerId])
 
+  // The restock agent reacts to a sale a second or two after it lands, so the
+  // stock figure this page fetched right after placing an order is already
+  // stale by the time it renders. Following the table keeps the column honest.
+  useLiveData('admin-owner-live', ['inventory', 'sales_transactions', 'orders', 'restock_orders'], () => {
+    if (ownerId) fetchAll({ silent: true })
+  })
+
   const categories = useMemo(() => {
     const set = new Set(products.map(p => p.family))
     return Array.from(set).sort()
   }, [products])
+
+  // Whole catalogue, deliberately ignoring the category/search filters — the
+  // button buys everything, so its count has to be everything.
+  const inStockCount = useMemo(() => products.filter(p => p.current_stock > 0).length, [products])
+  // Products that exist but cannot be sold. Surfaced so a count lower than the
+  // catalogue size explains itself instead of reading as a bug.
+  const outOfStockCount = useMemo(() => products.filter(p => p.current_stock <= 0).length, [products])
 
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -100,10 +125,15 @@ export default function AdminOwnerDetail() {
     )
   }, [products, search, category])
 
+  const STRIPE_PAYMENT_URL = 'https://buy.stripe.com/test_14A9AM9Qw4ohbGAaP91Fe01'
+
   async function placeOrder() {
     if (!orderProduct || qty < 1) return
     setPlacing(true)
     setToast(null)
+
+    // Open actual Stripe Checkout payment link in new window/tab
+    window.open(STRIPE_PAYMENT_URL, '_blank', 'noopener,noreferrer')
 
     // The whole order — sale row, stock decrement, audit row — happens inside
     // one Postgres transaction so a partial write can't skew the owner's books.
@@ -119,7 +149,7 @@ export default function AdminOwnerDetail() {
     } else {
       setToast({
         type: 'ok',
-        text: `Ordered ${qty} × ${orderProduct.name}. Recorded as a sale on the owner dashboard and stock reduced.`,
+        text: `Payment gateway launched & Order confirmed for ${qty} × ${orderProduct.name}. Recorded as a sale on the owner dashboard and stock reduced.`,
       })
       setOrderProduct(null)
       setQty(1)
@@ -129,6 +159,64 @@ export default function AdminOwnerDetail() {
     setPlacing(false)
   }
 
+  /** Opens the confirm panel and asks the server what the write would actually do. */
+  async function openBulk() {
+    setBulkOpen(true)
+    setBulkErr(null)
+    setBulkPreview(null)
+    setBulkLoading(true)
+    const { data, error } = await supabase.rpc('preview_owner_order_all', { p_owner_id: ownerId })
+    if (error) setBulkErr(error.message)
+    else {
+      const row = Array.isArray(data) ? data[0] : data
+      setBulkPreview(row ? {
+        product_count: Number(row.product_count) || 0,
+        total_units: Number(row.total_units) || 0,
+        total_amount: Number(row.total_amount) || 0,
+      } : null)
+    }
+    setBulkLoading(false)
+  }
+
+  /**
+   * Buys the full available stock of every in-stock product.
+   *
+   * One RPC, one transaction. Looping the single-product call from here would
+   * send quantities read from this page's state — which the restock agent
+   * rewrites underneath us — and a dropped connection would leave the owner's
+   * books half-updated.
+   */
+  async function buyEverything() {
+    setBulkRunning(true)
+    setBulkErr(null)
+    setToast(null)
+
+    window.open(STRIPE_PAYMENT_URL, '_blank', 'noopener,noreferrer')
+
+    const { data, error } = await supabase.rpc('place_owner_order_all', {
+      p_owner_id: ownerId,
+      p_note: 'Bulk purchase — all available stock',
+    })
+
+    if (error) {
+      setBulkErr(error.message)
+    } else {
+      const row = Array.isArray(data) ? data[0] : data
+      const count = Number(row?.product_count) || 0
+      const units = Number(row?.total_units) || 0
+      const amount = Number(row?.total_amount) || 0
+      setBulkOpen(false)
+      setToast(count === 0
+        ? { type: 'err', text: 'Nothing to buy — no product currently has stock.' }
+        : {
+          type: 'ok',
+          text: `Bought ${count} product${count === 1 ? '' : 's'} — ${units.toLocaleString()} units, $${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}. Recorded as sales on the owner dashboard; every product is now at zero stock.`,
+        })
+      await fetchAll()
+    }
+    setBulkRunning(false)
+  }
+
   const inputStyle: React.CSSProperties = {
     width: '100%', padding: '10px 12px', borderRadius: 10,
     background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.12)',
@@ -136,27 +224,44 @@ export default function AdminOwnerDetail() {
   }
 
   return (
-    <div style={{ padding: 28 }}>
+    // The gutter comes from .main-content — see AdminOwners.
+    <div className="page-enter">
       <button
-        className="btn"
+        className="btn btn-sm"
         onClick={() => navigate('/admin')}
-        style={{ marginBottom: 18 }}
+        style={{ marginBottom: 16 }}
       >
         <ArrowLeft size={15} /> All Owners
       </button>
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', marginBottom: 22 }}>
+      <div className="page-header page-header-row">
         <div>
-          <h1 style={{ fontSize: 26, fontWeight: 800, color: '#fff', margin: 0 }}>
-            {owner?.company || owner?.name || 'Owner'}
-          </h1>
-          <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', margin: '6px 0 0' }}>
-            {owner?.email} · {categories.length} categories · {products.length} products
-          </p>
+          <h1>{owner?.company || owner?.name || 'Owner'}</h1>
+          <p>{owner?.email} · {categories.length} categories · {products.length} products</p>
         </div>
-        <button className="btn" onClick={fetchAll} disabled={loading}>
-          <RefreshCw size={15} /> Refresh
-        </button>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          {/* Whole catalogue, not the filtered view — the count says so, so it
+              cannot be mistaken for "buy what I'm looking at". */}
+          <button
+            className="btn btn-primary"
+            onClick={openBulk}
+            disabled={loading || inStockCount === 0}
+            title={inStockCount === 0
+              ? 'No product currently has stock'
+              : outOfStockCount > 0
+                ? `Buys the full stock of ${inStockCount} products. ${outOfStockCount} excluded — already at zero stock.`
+                : 'Buy the full available stock of every product'}
+            style={{ opacity: inStockCount === 0 ? 0.45 : 1 }}
+          >
+            {/* "65 of 66" rather than a bare 65: a count smaller than the
+                catalogue looks like a miscount unless it says what it excluded. */}
+            <ShoppingBag size={15} /> Buy All Available
+            {outOfStockCount > 0 ? ` (${inStockCount} of ${products.length})` : ` (${inStockCount})`}
+          </button>
+          <button className="btn" onClick={() => fetchAll()} disabled={loading}>
+            <RefreshCw size={15} /> Refresh
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -179,6 +284,102 @@ export default function AdminOwnerDetail() {
           {toast.type === 'ok' ? <CheckCircle2 size={16} style={{ flexShrink: 0, marginTop: 2 }} /> : <AlertCircle size={16} style={{ flexShrink: 0, marginTop: 2 }} />}
           <span>{toast.text}</span>
         </div>
+      )}
+
+      {/* ── BUY-EVERYTHING CONFIRM ──
+          Not a nicety: this sells out the owner's entire catalogue in one
+          transaction and there is no undo button anywhere in the app. */}
+      {bulkOpen && createPortal(
+        <div
+          onClick={() => { if (!bulkRunning) setBulkOpen(false) }}
+          style={{ position: 'fixed', inset: 0, zIndex: 10000, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(10px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{ width: '100%', maxWidth: 520, background: 'rgba(8,12,28,0.98)', border: '1px solid rgba(108,99,255,0.4)', borderRadius: 22, padding: 30, boxShadow: '0 32px 80px rgba(0,0,0,0.8)', maxHeight: '88vh', overflowY: 'auto' }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18 }}>
+              <div>
+                <h2 style={{ margin: 0, fontSize: 19, color: '#fff' }}>Buy all available stock</h2>
+                <p style={{ margin: '6px 0 0', fontSize: 12.5, color: 'var(--clr-text-muted)' }}>
+                  {owner?.company || owner?.name || 'this owner'} · entire catalogue
+                  {outOfStockCount > 0 && (
+                    <> · <span style={{ color: '#f59e0b' }}>
+                      {outOfStockCount} of {products.length} already at zero stock, nothing to buy
+                    </span></>
+                  )}
+                </p>
+              </div>
+              <button
+                onClick={() => setBulkOpen(false)}
+                disabled={bulkRunning}
+                style={{ background: 'none', border: 'none', color: 'var(--clr-text-muted)', cursor: bulkRunning ? 'not-allowed' : 'pointer', padding: 4 }}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {bulkLoading ? (
+              <div style={{ padding: 26, textAlign: 'center', color: 'var(--clr-text-muted)', fontSize: 13 }}>
+                <Loader2 size={18} className="spin" style={{ display: 'block', margin: '0 auto 10px' }} />
+                Counting what is in stock…
+              </div>
+            ) : bulkErr ? (
+              <div style={{ display: 'flex', gap: 10, padding: 14, borderRadius: 12, background: 'rgba(244,63,94,0.08)', border: '1px solid rgba(244,63,94,0.3)', color: '#f43f5e', fontSize: 13, lineHeight: 1.6 }}>
+                <AlertCircle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+                <span>{bulkErr}</span>
+              </div>
+            ) : !bulkPreview || bulkPreview.product_count === 0 ? (
+              <div style={{ padding: 22, textAlign: 'center', color: 'var(--clr-text-muted)', fontSize: 13 }}>
+                No product currently has stock, so there is nothing to buy.
+              </div>
+            ) : (
+              <>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 16 }}>
+                  {[
+                    { k: 'Products', v: bulkPreview.product_count.toLocaleString(), c: '#6C63FF' },
+                    { k: 'Units', v: bulkPreview.total_units.toLocaleString(), c: '#00D4FF' },
+                    { k: 'Total', v: `$${bulkPreview.total_amount.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, c: '#22d3a8' },
+                  ].map(s => (
+                    <div key={s.k} style={{ padding: '12px 14px', borderRadius: 12, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', textAlign: 'center' }}>
+                      <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: 1 }}>{s.k}</div>
+                      <div style={{ fontSize: 19, fontWeight: 800, color: s.c }}>{s.v}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Say the consequences plainly rather than letting them be a
+                    surprise on the owner's pages afterwards. */}
+                <div style={{ padding: 14, borderRadius: 12, background: 'rgba(245,158,11,0.07)', border: '1px solid rgba(245,158,11,0.28)', marginBottom: 18 }}>
+                  <div style={{ display: 'flex', gap: 9, color: '#f59e0b', fontSize: 12.5, fontWeight: 700, marginBottom: 8 }}>
+                    <AlertCircle size={15} style={{ flexShrink: 0 }} /> This cannot be undone
+                  </div>
+                  <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: 'rgba(255,255,255,0.62)', lineHeight: 1.75 }}>
+                    <li>Every one of the {bulkPreview.product_count} products drops to <strong style={{ color: '#fff' }}>zero stock</strong>.</li>
+                    <li>Records {bulkPreview.product_count} sales on the owner's dashboard and revenue reports.</li>
+                    <li>Raises roughly {bulkPreview.product_count} low-stock notifications and queues everything for restock.</li>
+                    <li>Runs as one transaction — it all completes, or none of it does.</li>
+                  </ul>
+                </div>
+
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <button
+                    className="btn btn-primary"
+                    onClick={buyEverything}
+                    disabled={bulkRunning}
+                    style={{ flex: 1, justifyContent: 'center' }}
+                  >
+                    {bulkRunning
+                      ? <><Loader2 size={14} className="spin" /> Buying {bulkPreview.product_count} products…</>
+                      : <><CreditCard size={14} /> Pay &amp; Buy All {bulkPreview.product_count}</>}
+                  </button>
+                  <button className="btn" onClick={() => setBulkOpen(false)} disabled={bulkRunning}>Cancel</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>,
+        document.body
       )}
 
       {/* ── CATEGORY FILTER ── */}
@@ -321,7 +522,7 @@ export default function AdminOwnerDetail() {
                 disabled={placing || qty < 1 || qty > orderProduct.current_stock}
                 style={{ flex: 1, justifyContent: 'center' }}
               >
-                {placing ? <><Loader2 size={14} className="spin" /> Placing…</> : <><ShoppingCart size={14} /> Confirm Order</>}
+                {placing ? <><Loader2 size={14} className="spin" /> Processing Payment…</> : <><CreditCard size={14} /> Pay & Confirm Order</>}
               </button>
               <button className="btn" onClick={() => setOrderProduct(null)} disabled={placing}>Cancel</button>
             </div>

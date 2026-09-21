@@ -50,26 +50,17 @@ export default function Login() {
         className="glass-card"
         style={{ width: '100%', maxWidth: 420, padding: 32 }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
-          <div
-            style={{
-              width: 40, height: 40, borderRadius: 12,
-              background: 'linear-gradient(135deg,#6C63FF,#00D4FF)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}
-          >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-              <path
-                d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"
-                stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-              />
-            </svg>
-          </div>
-          <div>
-            <div style={{ fontSize: 20, fontWeight: 800, color: '#fff' }}>Inventiq</div>
-            <div style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>
-              Sign in to continue
-            </div>
+        {/* The full lockup carries the wordmark and tagline itself, so the
+            sign-in card leads with the brand rather than a generic icon. */}
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: 4 }}>
+          <img
+            src="/brand/logo-full.png"
+            alt="Inventiq — AI-driven autonomous systems"
+            className="brand-lockup"
+            style={{ width: 210, height: 'auto', marginBottom: 10 }}
+          />
+          <div style={{ fontSize: 13, color: 'var(--clr-text-muted)' }}>
+            Sign in to continue
           </div>
         </div>
 

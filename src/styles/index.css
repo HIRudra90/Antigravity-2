@@ -38,6 +38,11 @@
   --sidebar-w:        72px;
   --sidebar-w-open:   240px;
 
+  /* Top bar — a token because page-level overlays (toasts) have to clear it */
+  --topbar-h:         58px;
+  /* Page gutter, shared by the bar and the content beneath so they line up */
+  --page-gutter:      28px;
+
   /* Glass — NO backdrop-filter on most elements for max perf */
   --glass-bg:         rgba(10,12,25,0.82);
   --glass-blur:       none;
@@ -165,6 +170,22 @@ body {
   flex-shrink: 0;
   box-shadow: 0 0 20px var(--clr-accent-glow);
 }
+
+/* ─── Brand marks ────────────────────────────────────────────────────────
+   The artwork already carries its own glow, so it sits on the background
+   directly rather than inside a gradient tile — a plate behind it would
+   double the glow and box in the hexagon's silhouette. */
+.brand-mark {
+  flex-shrink: 0;
+  object-fit: contain;
+  /* Lifts the mark off very dark panels without altering its colours. */
+  filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.28));
+}
+.brand-lockup {
+  display: block;
+  object-fit: contain;
+  filter: drop-shadow(0 0 22px rgba(108, 99, 255, 0.28));
+}
 .sidebar-logo-text {
   font-family: var(--font-display);
   font-size: 18px;
@@ -284,22 +305,155 @@ body {
 .sidebar:hover .nav-item-label { opacity: 1; }
 
 /* ============================================================
+   CONTENT COLUMN — top bar (fixed) over the scrolling page
+   ============================================================ */
+.content-col {
+  flex: 1;
+  min-width: 0;          /* lets wide tables scroll instead of stretching the shell */
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  z-index: 10;
+}
+
+.topbar {
+  flex-shrink: 0;
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 var(--page-gutter);
+  /* Translucent glass, not a solid lid.
+     --glass-bg (0.82) was not enough here, because the bar is not sitting
+     directly on the scene: .spline-overlay lays rgba(5,8,16,0.5) over the
+     canvas first, so 0.82 on top of that left only ~9% of the artwork showing
+     (0.18 x 0.5) — indistinguishable from opaque wherever the scene is dark,
+     which it is along the top edge. A lighter fill is what actually makes it
+     read as glass.
+     The faint vertical gradient keeps it from looking like a flat scrim, and
+     the blur carries legibility where bright artwork passes underneath. One
+     58px strip, using the blur the notification and calendar dropdowns already
+     use — it does not reopen the app-wide "no backdrop-filter" perf rule. */
+  background: linear-gradient(180deg, rgba(12,15,30,0.62), rgba(10,12,25,0.48));
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  border-bottom: 1px solid var(--glass-border);
+  /* Above .main-content so the notification panel opens over the page. */
+  position: relative;
+  z-index: 2;
+}
+
+.topbar-left,
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.topbar-menu-btn {
+  display: none;          /* mobile only — see the responsive block */
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  border: 1px solid var(--clr-border);
+  background: rgba(255,255,255,0.04);
+  color: #fff;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.topbar-menu-btn:hover { border-color: var(--clr-border-hover); }
+
+/* Breadcrumb, deliberately small: the page's own <h1> is the heading, this is
+   just where-you-are. */
+.topbar-trail {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  min-width: 0;
+  white-space: nowrap;
+}
+.topbar-trail-root    { color: var(--clr-text-dim); font-weight: 500; }
+.topbar-trail-sep     { color: var(--clr-text-dim); }
+.topbar-trail-current {
+  color: var(--clr-text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar-clock {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 36px;          /* same height as the bell beside it */
+  padding: 0 11px;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--clr-border);
+  cursor: default;
+  white-space: nowrap;
+}
+/* The clock opens the reminder calendar, so it is a real button now: reset the
+   inherited font and give it the affordance the bell beside it already has. */
+.topbar-clock-btn {
+  font: inherit;
+  cursor: pointer;
+  transition: background 0.18s, border-color 0.18s;
+}
+.topbar-clock-btn:hover {
+  background: rgba(255,255,255,0.08);
+  border-color: rgba(255,255,255,0.18);
+}
+.topbar-clock-time {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--clr-text);
+  font-variant-numeric: tabular-nums;  /* stops the bar twitching each minute */
+}
+.topbar-clock-date { font-size: 11.5px; color: var(--clr-text-muted); }
+
+/* ============================================================
    MAIN CONTENT
    ============================================================ */
 .main-content {
   flex: 1;
-  height: 100vh;
+  min-height: 0;
   overflow-y: auto;
   position: relative;
-  z-index: 10;
-  padding: 28px;
+  z-index: 1;
+  padding: 24px var(--page-gutter) 32px;
+  scrollbar-gutter: stable;  /* no horizontal shift when content grows past a screen */
 }
 
 /* ============================================================
    PAGE HEADER
    ============================================================ */
 .page-header {
-  margin-bottom: 28px;
+  margin-bottom: 26px;
+}
+
+/* Title on the left, page actions on the right. Every page used to hand-roll
+   this row inline and they disagreed on alignment — flex-start here, center
+   there, flex-end on one — so the action buttons sat at a different height on
+   each page. One class, one answer. */
+.page-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;   /* actions drop below the title rather than squeezing it */
+  gap: 16px;
+}
+
+/* Safety net for any header still declaring flex inline. */
+.page-header[style*="flex"] {
+  flex-wrap: wrap;
+  gap: 16px;
 }
 .page-header h1 {
   font-family: var(--font-display);
@@ -582,6 +736,81 @@ select.glass-input option {
   color: #ffffff;
 }
 
+/* ─── Form fields ────────────────────────────────────────────────────────
+   .form-input was used in markup but never defined, so those controls fell
+   back to unstyled browser defaults: fixed-width boxes sitting inline beside
+   their labels. Defining it here fixes the layout at the source rather than
+   patching each call site with inline styles. */
+.form-group { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+.form-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--clr-text-muted);
+  letter-spacing: 0.01em;
+}
+.form-label .req { color: #f43f5e; margin-left: 2px; }
+.form-hint { font-size: 11px; color: var(--clr-text-dim); }
+
+.form-input {
+  display: block;
+  width: 100%;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--clr-border);
+  border-radius: var(--r-md);
+  padding: 10px 14px;
+  color: var(--clr-text);
+  font-family: var(--font-body);
+  font-size: 13.5px;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+.form-input::placeholder { color: var(--clr-text-dim); }
+.form-input:hover { border-color: rgba(180,220,255,0.35); }
+.form-input:focus {
+  border-color: rgba(108,99,255,0.85);
+  background: rgba(255,255,255,0.08);
+  box-shadow: 0 0 0 3px rgba(108,99,255,0.18);
+}
+textarea.form-input { resize: vertical; min-height: 68px; line-height: 1.5; }
+select.form-input { cursor: pointer; }
+select.form-input option { background-color: #0c0f1d; color: #ffffff; }
+
+/* Grouped section inside a form — gives each block a visible boundary. */
+.form-section {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: var(--r-md);
+  padding: 16px;
+  background: rgba(255,255,255,0.02);
+}
+.form-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--clr-text-muted);
+  margin-bottom: 14px;
+}
+.form-section-title .step-dot {
+  width: 20px; height: 20px; border-radius: 50%;
+  background: rgba(108,99,255,0.2);
+  border: 1px solid rgba(108,99,255,0.5);
+  color: #a78bfa;
+  font-size: 10px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center;
+  letter-spacing: 0;
+}
+
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.form-grid .span-2 { grid-column: 1 / -1; }
+@media (max-width: 520px) {
+  .form-grid { grid-template-columns: 1fr; }
+}
+
 .glass-select {
   appearance: none;
   cursor: pointer;
@@ -728,9 +957,6 @@ a[href*="spline.design"],
 /* ============================================================
    MOBILE / RESPONSIVE
    ============================================================ */
-.mobile-menu-btn {
-  display: none;
-}
 .sidebar-close-btn {
   display: none;
 }
@@ -739,23 +965,14 @@ a[href*="spline.design"],
 }
 
 @media (max-width: 860px) {
-  /* Hamburger toggle — fixed top-left, only exists on mobile */
-  .mobile-menu-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    position: fixed;
-    top: 14px;
-    left: 14px;
-    z-index: 1200;
-    width: 40px;
-    height: 40px;
-    border-radius: 10px;
-    border: 1px solid var(--glass-border);
-    background: rgba(10,12,25,0.92);
-    color: #fff;
-    cursor: pointer;
+  :root {
+    --topbar-h:    54px;
+    --page-gutter: 16px;
   }
+
+  /* The drawer toggle lives in the bar on mobile; on desktop the rail is
+     always visible so there is nothing to toggle. */
+  .topbar-menu-btn { display: flex; }
 
   /* Sidebar becomes an off-canvas drawer instead of a hover-expand rail */
   .sidebar {
@@ -798,12 +1015,18 @@ a[href*="spline.design"],
     background: rgba(0,0,0,0.55);
   }
 
-  /* Content takes full width with room for the hamburger button */
+  /* Full width — the bar above reserves its own space, so no top offset */
   .main-content {
-    padding: 20px 16px 24px;
-    padding-top: 70px;
+    padding: 18px var(--page-gutter) 24px;
     width: 100%;
   }
+
+  /* Date + time is the first thing to give up its room to the breadcrumb */
+  /* Was display:none. The clock is now the only way into the reminder
+     calendar, so it stays — the date label is what gets dropped, since the
+     time alone still fits and still opens the calendar. */
+  .topbar-clock { padding: 0 9px; }
+  .topbar-clock-date { display: none; }
 
   .page-header {
     margin-bottom: 20px;
@@ -811,8 +1034,9 @@ a[href*="spline.design"],
   .page-header h1 {
     font-size: 22px;
   }
-  /* Most page headers inline-style a flex row for title + action button —
-     this fills in flex-direction (not set inline) so it's safe to override */
+  /* Title and actions stack on a phone — side by side leaves neither enough
+     room to read. The attribute selector covers any header still inline-styled. */
+  .page-header-row,
   .page-header[style*="flex"] {
     flex-direction: column;
     align-items: flex-start !important;

@@ -47,19 +47,25 @@ FAMILY_SEARCH_TERMS = {
 }
 
 
-def fetch_market_news(product_name: str, product_family: str) -> str:
+def fetch_market_news_detailed(product_name: str, product_family: str) -> dict:
     """
-    Fetches recent market news from NewsAPI for the given product.
-    Cache key is DATE + FAMILY so the same product on the same day
-    always returns the same headlines — stable LLM input all day.
+    Recent market news from NewsAPI, as both the LLM prompt blob and the
+    structured headlines behind it.
+
+    The structured form is what lets the UI show which articles actually drove
+    a reading, instead of asking the user to trust a number.
+
+    Cache key is DATE + FAMILY so the same family on the same day always gets
+    the same headlines — a stable input all day.
     """
+    empty = {"text": "", "headlines": [], "query_used": "", "status": "no_key"}
+
     if not settings.NEWS_API_KEY:
         print("[News] NEWS_API_KEY not set — skipping")
-        return ""
+        return empty
 
-    # Day-level cache key: stable within a calendar day
     today_str = date.today().strftime("%Y%m%d")
-    cache_key = f"news_{today_str}_{product_family.upper().replace(' ', '_')}"
+    cache_key = f"newsdet_{today_str}_{product_family.upper().replace(' ', '_')}"
     cached = _read(cache_key, ttl=86400)
     if cached is not None:
         print(f"[News] Cached news for {product_family} ({today_str})")
@@ -76,7 +82,7 @@ def fetch_market_news(product_name: str, product_family: str) -> str:
         "global supply chain demand inventory market",
     ]
 
-    articles = []
+    articles, query_used, status = [], "", "no_results"
     with httpx.Client(timeout=10) as client:
         for query in queries:
             try:
@@ -89,24 +95,48 @@ def fetch_market_news(product_name: str, product_family: str) -> str:
                 data = resp.json()
                 if data.get("status") == "ok" and data.get("articles"):
                     articles = data["articles"]
+                    query_used = query
+                    status = "ok"
                     print(f"[News] Got {len(articles)} articles for query: {query!r}")
                     break
+                if data.get("status") == "error":
+                    print(f"[News] API error: {data.get('code')} {data.get('message')}")
+                    status = f"error: {data.get('code')}"
             except Exception as e:
                 print(f"[News] Query '{query}' failed: {e}")
+                status = "request_failed"
 
     if not articles:
         print(f"[News] No news found for '{product_name}' ({product_family})")
-        return ""
+        return {"text": "", "headlines": [], "query_used": query_used, "status": status}
 
-    lines = [f"Latest market news for {product_name} ({product_family}):\n"]
+    headlines, lines = [], [f"Latest market news for {product_name} ({product_family}):\n"]
     for article in articles[:5]:
         title = article.get("title") or ""
         desc = article.get("description") or ""
-        if title and "[Removed]" not in title:
-            lines.append(f"• {title}")
-            if desc and "[Removed]" not in desc:
-                lines.append(f"  {desc}")
+        if not title or "[Removed]" in title:
+            continue
+        headlines.append({
+            "title": title,
+            "description": "" if "[Removed]" in desc else desc,
+            "source": (article.get("source") or {}).get("name", ""),
+            "published_at": article.get("publishedAt", ""),
+            "url": article.get("url", ""),
+        })
+        lines.append(f"• {title}")
+        if desc and "[Removed]" not in desc:
+            lines.append(f"  {desc}")
 
-    result = "\n".join(lines)
+    result = {
+        "text": "\n".join(lines),
+        "headlines": headlines,
+        "query_used": query_used,
+        "status": "ok" if headlines else "no_usable_articles",
+    }
     _write(cache_key, result)
     return result
+
+
+def fetch_market_news(product_name: str, product_family: str) -> str:
+    """Prompt-blob form, for callers that only need the text."""
+    return fetch_market_news_detailed(product_name, product_family)["text"]

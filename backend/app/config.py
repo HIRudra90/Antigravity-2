@@ -34,6 +34,14 @@ class Settings:
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     NEWS_API_KEY: str = os.getenv("NEWS_API_KEY", "")
+
+    # Countries whose public holidays move THIS business's demand. Was hardcoded
+    # to US+UK, which fed irrelevant holidays into the demand model.
+    MARKET_COUNTRIES: str = os.getenv("MARKET_COUNTRIES", "MY")
+
+    def market_countries(self) -> list:
+        codes = [c.strip().upper() for c in self.MARKET_COUNTRIES.split(",") if c.strip()]
+        return codes or ["MY"]
     
     # Model binary paths
     MODELS_DIR: str = os.path.join(BACKEND_DIR, "models_bin")

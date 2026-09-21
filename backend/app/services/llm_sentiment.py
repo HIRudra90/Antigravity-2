@@ -1,3 +1,25 @@
+"""
+Market demand sentiment.
+
+Design note — why this is not one big LLM call any more
+------------------------------------------------------
+The previous version handed the oil price, the holiday list and the news to
+gpt-4o-mini and asked it to return a single multiplier. Two things went wrong:
+
+1. The prompt scored oil against a fixed $90 threshold. WTI has traded $90-96
+   on every day this system has run, so every prediction took the same "oil is
+   high" penalty and the multiplier sat at ~0.92 forever. 76 stored forecasts
+   held just five distinct values. A constant is not a signal.
+
+2. The arithmetic was unauditable. The model returned a number and a paragraph,
+   and nothing could be traced back to an input.
+
+So the scoring is now deterministic and decomposed — oil and holidays are
+arithmetic over real measurements — and the LLM is used for the one part that
+genuinely needs language understanding: reading headlines. Each component
+reports its own contribution, so the multiplier can be explained line by line.
+"""
+
 import re
 import json
 from datetime import date
@@ -5,106 +27,160 @@ from openai import OpenAI
 from app.config import settings
 from app.services.market_context import _read, _write, stable_hash
 
+# Per-component caps. Oil and news are comparable in size; a holiday inside a
+# fortnight is the single strongest short-term driver in retail.
+OIL_CAP = 0.08
+NEWS_CAP = 0.08
+HOLIDAY_CAP = 0.12
+
+MULTIPLIER_FLOOR = 0.70
+MULTIPLIER_CEIL = 1.30
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _oil_component(oil: dict) -> dict:
+    """
+    Score oil by how far it has moved, not by where it sits.
+
+    Blends two horizons: where the price sits against its own 90-day average
+    (the persistent squeeze) and how far it has moved in 30 days (the shock).
+    Oil parked at a high-but-steady level scores ~0, which is the entire point
+    — that is a cost base the market has already absorbed, not news.
+    """
+    pct_vs_avg = float(oil.get("pct_vs_avg") or 0.0)
+    pct_30d = float(oil.get("pct_30d") or 0.0)
+    signal = 0.6 * pct_vs_avg + 0.4 * pct_30d
+
+    # Rising oil squeezes discretionary spend, so the contribution is inverted.
+    contribution = _clamp(-signal * 0.005, -OIL_CAP, OIL_CAP)
+
+    price = float(oil.get("price") or 0.0)
+    avg = float(oil.get("avg_90d") or 0.0)
+    if abs(signal) < 2:
+        detail = (f"${price:.2f}/bbl, in line with its 90-day average of ${avg:.2f} "
+                  f"({pct_vs_avg:+.1f}%). A steady cost base, already priced in.")
+    elif signal > 0:
+        detail = (f"${price:.2f}/bbl — {pct_vs_avg:+.1f}% above its 90-day average of "
+                  f"${avg:.2f} and {pct_30d:+.1f}% in 30 days. Rising fuel costs squeeze "
+                  f"transport and discretionary spend.")
+    else:
+        detail = (f"${price:.2f}/bbl — {pct_vs_avg:+.1f}% below its 90-day average of "
+                  f"${avg:.2f} and {pct_30d:+.1f}% in 30 days. Cheaper logistics support "
+                  f"margins and consumer demand.")
+
+    return {
+        "label": "Oil price (WTI)",
+        "detail": detail,
+        "contribution": round(contribution, 4),
+    }
+
+
+def _holiday_component(holidays: list) -> dict:
+    """
+    Nearest relevant holiday only.
+
+    Summing every holiday in a 60-day window let a dense calendar stack up an
+    arbitrarily large boost. Retail demand pulls forward toward the next event;
+    it does not add one lift per entry in the list.
+    """
+    if not holidays:
+        return {
+            "label": "Public holidays",
+            "detail": f"No public holidays in the next 60 days for {', '.join(settings.market_countries())}.",
+            "contribution": 0.0,
+        }
+
+    nearest = min(holidays, key=lambda h: h["days_until"])
+    days = nearest["days_until"]
+
+    if days <= 7:
+        contribution, band = 0.10, "this week"
+    elif days <= 14:
+        contribution, band = 0.07, "within a fortnight"
+    elif days <= 30:
+        contribution, band = 0.04, "within the month"
+    else:
+        contribution, band = 0.015, "still over a month out"
+
+    contribution = min(contribution, HOLIDAY_CAP)
+    others = len(holidays) - 1
+    detail = (f"{nearest['name']} ({nearest['country']}) in {days} days — {band}. "
+              f"Pre-holiday buying lifts consumer goods.")
+    if others > 0:
+        detail += f" {others} more in the next 60 days."
+
+    return {
+        "label": "Public holidays",
+        "detail": detail,
+        "contribution": round(contribution, 4),
+    }
+
 
 def _openrouter_client() -> OpenAI:
-    return OpenAI(
-        api_key=settings.OPENROUTER_API_KEY,
-        base_url=settings.OPENROUTER_BASE_URL,
-    )
+    return OpenAI(api_key=settings.OPENROUTER_API_KEY, base_url=settings.OPENROUTER_BASE_URL)
+
+
+def _has_llm_key() -> bool:
+    key = settings.OPENROUTER_API_KEY
+    return bool(key) and not key.startswith("your_") and len(key) > 10
 
 
 def _parse_json(text: str) -> dict:
-    """Robustly extract JSON from LLM response."""
+    """LLMs wrap JSON in prose and fences often enough that this must be robust."""
     try:
         return json.loads(text)
     except Exception:
         pass
-    match = re.search(r'\{[\s\S]*\}', text)
+    match = re.search(r"\{[\s\S]*\}", text)
     if match:
         try:
             return json.loads(match.group())
         except Exception:
             pass
-    result = {}
-    m = re.search(r'"multiplier"\s*:\s*([0-9.]+)', text)
+    out = {}
+    m = re.search(r'"news_score"\s*:\s*(-?[0-9.]+)', text)
     if m:
-        result["multiplier"] = float(m.group(1))
-    m = re.search(r'"direction"\s*:\s*"(UP|DOWN|NEUTRAL)"', text, re.IGNORECASE)
+        out["news_score"] = float(m.group(1))
+    m = re.search(r'"summary"\s*:\s*"([^"]{10,})"', text)
     if m:
-        result["direction"] = m.group(1).upper()
-    kf = re.search(r'"key_factors"\s*:\s*\[(.*?)\]', text, re.DOTALL)
-    if kf:
-        result["key_factors"] = re.findall(r'"([^"]{10,})"', kf.group(1))
-    m = re.search(r'"analysis"\s*:\s*"([^"]{15,})"', text)
-    if m:
-        result["analysis"] = m.group(1)
-    return result
+        out["summary"] = m.group(1)
+    return out
 
 
-def analyze_sentiment(
-    market_text: str,
-    oil_price: float = 78.5,
-    holidays: list = None,
-) -> tuple:
+def _news_component(market_text: str) -> dict:
     """
-    Comprehensive market demand analysis using real oil price, upcoming holidays, and news.
+    Read the headlines and score them from -1 (demand-destroying) to +1.
 
-    Returns: (multiplier: float, analysis: str, key_factors: list[str])
+    This is the only part an LLM is actually better at than arithmetic, so it is
+    the only part it does. The score is bounded and scaled here rather than in
+    the prompt, which keeps a hallucinated number from moving the multiplier
+    more than its share.
 
-    Cache key: DATE + oil_price_rounded + news_fingerprint
-    → Same product on the same day always returns the same result.
+    Cached on the headline fingerprint alone. The old cache key mixed in the
+    rounded oil price, so a $1 oil move threw away a still-valid reading of the
+    news while a stale reading survived into the next day.
     """
-    if holidays is None:
-        holidays = []
+    if not market_text or not market_text.strip():
+        return {
+            "label": "Market news",
+            "detail": "No relevant headlines retrieved for this product family.",
+            "contribution": 0.0,
+            "score": None,
+            "engine": "none",
+        }
 
-    # Stable, deterministic cache key
-    news_fp = stable_hash(market_text[:300]) if market_text else "nonews"
-    oil_rounded = round(oil_price)
-    cache_key = f"sentiment_{date.today().strftime('%Y%m%d')}_{oil_rounded}_{news_fp}"
-
+    fingerprint = stable_hash(market_text[:1200])
+    cache_key = f"newsscore_{date.today().strftime('%Y%m%d')}_{fingerprint}"
     cached = _read(cache_key, ttl=86400)
-    if cached:
-        print(f"[Sentiment] Cached: multiplier={cached['multiplier']}")
-        return cached["multiplier"], cached["analysis"], cached["key_factors"]
+    if cached is not None:
+        return cached
 
-    # ── Build rich context ──────────────────────────────────────────
-    context_parts = []
+    score, summary, engine = 0.0, "", "rules"
 
-    if oil_price > 90:
-        oil_signal = f"HIGH — above $90/bbl signals elevated transport and production costs, which typically suppresses consumer purchasing power"
-    elif oil_price < 65:
-        oil_signal = f"LOW — below $65/bbl reduces logistics costs and supports consumer demand"
-    else:
-        oil_signal = f"MODERATE — in the normal $65–$90 range, minimal impact on baseline demand"
-    context_parts.append(f"OIL PRICE (WTI Crude, live): ${oil_price:.2f}/barrel\nSignal: {oil_signal}")
-
-    if holidays:
-        near = [h for h in holidays if h["days_until"] <= 30]
-        far = [h for h in holidays if h["days_until"] > 30]
-        hol_lines = []
-        for h in near:
-            hol_lines.append(f"• {h['name']} ({h['date']}, in {h['days_until']} days) ← NEAR TERM")
-        for h in far:
-            hol_lines.append(f"• {h['name']} ({h['date']}, in {h['days_until']} days)")
-        context_parts.append("UPCOMING PUBLIC HOLIDAYS (next 60 days):\n" + "\n".join(hol_lines))
-    else:
-        context_parts.append("UPCOMING PUBLIC HOLIDAYS: None detected in the next 60 days.")
-
-    if market_text and market_text.strip():
-        context_parts.append(f"MARKET NEWS:\n{market_text.strip()}")
-    else:
-        context_parts.append("MARKET NEWS: No specific news available for this product family.")
-
-    full_context = "\n\n".join(context_parts)
-
-    # ── LLM Call ───────────────────────────────────────────────────
-    has_key = (
-        settings.OPENROUTER_API_KEY
-        and not settings.OPENROUTER_API_KEY.startswith("your_")
-        and len(settings.OPENROUTER_API_KEY) > 10
-    )
-
-    if has_key:
+    if _has_llm_key():
         try:
             client = _openrouter_client()
             response = client.chat.completions.create(
@@ -112,111 +188,114 @@ def analyze_sentiment(
                 messages=[
                     {
                         "role": "system",
-                        "content": """You are a senior inventory demand analyst. Study the REAL market data below and output a demand multiplier with evidence-based reasoning.
-
-Return ONLY valid JSON — no extra text, no markdown, just the JSON object:
-{
-  "multiplier": <float between 0.70 and 1.30>,
-  "direction": "<UP|DOWN|NEUTRAL>",
-  "key_factors": [
-    "<specific finding from the data — quote actual numbers>",
-    "<specific finding from the data — reference oil price or holiday or news>",
-    "<specific finding from the data>"
-  ],
-  "analysis": "<2-3 sentences of concrete reasoning citing the actual oil price, the specific holidays, and the specific news provided. Do NOT be vague.>"
-}
-
-Multiplier guidelines (apply cumulatively):
-- Baseline: 1.00
-- Oil above $90/bbl: −0.04 to −0.08 (cost pressure reduces demand)
-- Oil below $65/bbl: +0.03 to +0.06 (cost relief boosts demand)
-- Major holiday within 14 days: +0.08 to +0.15 for consumer goods
-- Major holiday 15–30 days away: +0.04 to +0.09
-- Holiday 31–60 days away: +0.01 to +0.04
-- Strong positive news (shortage, surge, high demand): +0.05 to +0.12
-- Strong negative news (recession, oversupply, slump): −0.05 to −0.12
-- Moderate/mixed signals: ±0.02 to 0.05
-- ALWAYS reference actual values from the data in your key_factors and analysis""",
+                        "content": (
+                            "You are a retail demand analyst. Read the headlines and judge their net "
+                            "effect on near-term CONSUMER DEMAND for the product family described.\n\n"
+                            "Return ONLY this JSON:\n"
+                            '{"news_score": <float -1.0 to 1.0>, "summary": "<one or two sentences '
+                            'citing the specific headlines that drove the score>"}\n\n'
+                            "Scale: -1.0 demand collapse (recession, mass layoffs, collapsing consumer "
+                            "confidence); -0.5 clearly negative; 0.0 routine or mixed coverage with no "
+                            "demand implication; +0.5 clearly positive; +1.0 demand surge (shortages, "
+                            "panic buying, stimulus).\n\n"
+                            "Most business news is routine and deserves a score near 0.0. Reserve "
+                            "scores beyond ±0.5 for headlines that plainly describe a demand shock. "
+                            "Judge demand only — a company's share price is not consumer demand."
+                        ),
                     },
-                    {"role": "user", "content": full_context},
+                    {"role": "user", "content": market_text[:4000]},
                 ],
-                max_tokens=450,
+                max_tokens=300,
                 temperature=0.0,
             )
-
-            raw = response.choices[0].message.content.strip()
-            print(f"[Sentiment] LLM raw: {raw[:300]}")
-            parsed = _parse_json(raw)
-
-            multiplier = max(0.70, min(1.30, float(parsed.get("multiplier", 1.00))))
-            direction = parsed.get("direction", "NEUTRAL").upper()
-            key_factors = parsed.get("key_factors", [])
-            analysis = parsed.get("analysis", "")
-
-            if not key_factors:
-                key_factors = [
-                    f"Oil price: ${oil_price:.2f}/barrel ({oil_signal.split('—')[0].strip()})",
-                    f"{len(holidays)} upcoming holidays detected in next 60 days",
-                    "Market news analyzed for demand signals",
-                ]
-            if not analysis:
-                analysis = f"Based on oil at ${oil_price:.2f}/bbl, {len(holidays)} upcoming holidays, and available market news."
-
-            result = {
-                "multiplier": multiplier,
-                "direction": direction,
-                "key_factors": key_factors,
-                "analysis": analysis,
-            }
-            _write(cache_key, result)
-            print(f"[Sentiment] LLM result: x{multiplier} ({direction})")
-            return multiplier, analysis, key_factors
-
+            parsed = _parse_json(response.choices[0].message.content.strip())
+            score = _clamp(float(parsed.get("news_score", 0.0)), -1.0, 1.0)
+            summary = parsed.get("summary", "") or ""
+            engine = "gpt-4o-mini"
+            print(f"[News] LLM score {score:+.2f}: {summary[:120]}")
         except Exception as e:
-            print(f"[Sentiment] OpenRouter failed: {e} — falling back to rules")
-
-    # ── Rule-based fallback ────────────────────────────────────────
-    return _rule_fallback(market_text, oil_price, holidays)
-
-
-def _rule_fallback(market_text: str, oil_price: float, holidays: list) -> tuple:
-    score = 0.0
-    factors = []
-
-    if oil_price > 90:
-        score -= 0.06
-        factors.append(f"Oil at ${oil_price:.2f}/bbl — above $90 signals elevated costs")
-    elif oil_price < 65:
-        score += 0.05
-        factors.append(f"Oil at ${oil_price:.2f}/bbl — below $65 reduces transport costs")
+            print(f"[News] OpenRouter failed: {e} — falling back to keyword scoring")
+            score, summary, engine = _keyword_score(market_text)
     else:
-        factors.append(f"Oil at ${oil_price:.2f}/bbl — moderate, normal demand impact")
+        score, summary, engine = _keyword_score(market_text)
 
-    near = [h for h in holidays if h["days_until"] <= 30]
-    if near:
-        score += min(0.15, len(near) * 0.07)
-        factors.append(f"{near[0]['name']} in {near[0]['days_until']} days — holiday demand spike expected")
-    elif holidays:
-        score += 0.03
-        factors.append(f"{holidays[0]['name']} in {holidays[0]['days_until']} days — early pre-holiday build")
+    component = {
+        "label": "Market news",
+        "detail": summary or "Headlines retrieved but no clear demand signal.",
+        "contribution": round(score * NEWS_CAP, 4),
+        "score": round(score, 3),
+        "engine": engine,
+    }
+    _write(cache_key, component)
+    return component
 
-    if market_text:
-        lower = market_text.lower()
-        pos = sum(1 for w in ["growth", "surge", "increase", "shortage", "high demand", "boom"] if w in lower)
-        neg = sum(1 for w in ["recession", "decline", "decrease", "low demand", "surplus", "slump"] if w in lower)
-        if pos > neg:
-            score += min(0.10, (pos - neg) * 0.04)
-            factors.append(f"News shows positive demand signals ({pos} positive keywords)")
-        elif neg > pos:
-            score -= min(0.10, (neg - pos) * 0.04)
-            factors.append(f"News shows negative demand signals ({neg} negative keywords)")
-        else:
-            factors.append("Market news shows mixed/neutral signals")
 
-    multiplier = round(max(0.70, min(1.30, 1.0 + score)), 2)
-    analysis = (
-        f"Rule-based analysis (LLM unavailable). "
-        f"Oil at ${oil_price:.2f}/bbl, {len(holidays)} upcoming holidays detected, "
-        f"combined score: {score:+.2f} → demand multiplier x{multiplier}."
-    )
-    return multiplier, analysis, factors
+def _keyword_score(market_text: str) -> tuple:
+    """Fallback when the LLM is unavailable. Crude, and labelled as such."""
+    lower = market_text.lower()
+    positive = ["shortage", "surge", "high demand", "boom", "growth", "stimulus", "rebound"]
+    negative = ["recession", "slump", "layoff", "downturn", "oversupply", "weak demand", "inflation"]
+    pos = sum(1 for w in positive if w in lower)
+    neg = sum(1 for w in negative if w in lower)
+    if pos == neg:
+        return 0.0, f"Keyword scan: {pos} positive and {neg} negative signals — no net direction.", "keywords"
+    score = _clamp((pos - neg) * 0.25, -1.0, 1.0)
+    return score, f"Keyword scan: {pos} positive vs {neg} negative demand signals.", "keywords"
+
+
+def analyze_market(market_text: str, oil: dict, holidays: list) -> dict:
+    """
+    The full market reading: every component, its contribution, and the total.
+
+    multiplier = 1.00 + oil + holidays + news, clamped to [0.70, 1.30].
+    """
+    components = [
+        _oil_component(oil),
+        _holiday_component(holidays),
+        _news_component(market_text),
+    ]
+
+    total = sum(c["contribution"] for c in components)
+    multiplier = round(_clamp(1.0 + total, MULTIPLIER_FLOOR, MULTIPLIER_CEIL), 4)
+    direction = "UP" if multiplier > 1.02 else "DOWN" if multiplier < 0.98 else "NEUTRAL"
+
+    movers = sorted(components, key=lambda c: abs(c["contribution"]), reverse=True)
+    lead = movers[0]
+    if abs(lead["contribution"]) < 0.005:
+        analysis = (
+            f"No component is currently pushing demand off its baseline, so the multiplier "
+            f"sits at x{multiplier:.3f}. Oil is steady against its own 90-day average, and "
+            f"neither the holiday calendar nor the news carries a demand signal."
+        )
+    else:
+        analysis = (
+            f"Demand multiplier x{multiplier:.3f} ({direction}). The largest mover is "
+            f"{lead['label'].lower()} at {lead['contribution']:+.3f}: {lead['detail']} "
+            f"Combined across all three inputs: {total:+.3f} against a 1.000 baseline."
+        )
+
+    return {
+        "multiplier": multiplier,
+        "direction": direction,
+        "analysis": analysis,
+        "key_factors": [f"{c['label']}: {c['detail']}" for c in components],
+        "components": components,
+        "total_adjustment": round(total, 4),
+        "news_engine": components[2].get("engine", "none"),
+    }
+
+
+def analyze_sentiment(market_text: str, oil_price: float = 78.5, holidays: list = None) -> tuple:
+    """
+    Backwards-compatible tuple wrapper: (multiplier, analysis, key_factors).
+
+    Accepts either the full oil context dict or a bare price. A bare price has
+    no trailing average to compare against, so it scores as neutral on oil —
+    deliberately, since a level alone is not evidence either way.
+    """
+    oil = oil_price if isinstance(oil_price, dict) else {
+        "price": float(oil_price), "avg_90d": float(oil_price),
+        "pct_vs_avg": 0.0, "pct_30d": 0.0, "trend": "UNKNOWN",
+    }
+    result = analyze_market(market_text, oil, holidays or [])
+    return result["multiplier"], result["analysis"], result["key_factors"]

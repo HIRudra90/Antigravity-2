@@ -57,13 +57,13 @@ export default function AdminOwners() {
   ]
 
   return (
-    <div style={{ padding: 28 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24, gap: 16, flexWrap: 'wrap' }}>
+    // No padding of its own: .main-content already supplies the page gutter,
+    // and adding 28 here doubled it against every owner-side page.
+    <div className="page-enter">
+      <div className="page-header page-header-row">
         <div>
-          <h1 style={{ fontSize: 26, fontWeight: 800, color: '#fff', margin: 0 }}>Owner Management</h1>
-          <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', margin: '6px 0 0' }}>
-            Every business using Inventiq. Open one to view its catalogue and place orders.
-          </p>
+          <h1>Owner Management</h1>
+          <p>Every business using Inventiq. Open one to view its catalogue and place orders.</p>
         </div>
         <button className="btn" onClick={fetchOwners} disabled={loading}>
           <RefreshCw size={15} /> Refresh

@@ -2,11 +2,15 @@ import { Suspense, lazy, useState } from 'react'
 import { BrowserRouter, Routes, Route, NavLink, useLocation, Navigate } from 'react-router-dom'
 import {
   LayoutDashboard, Package, Users, RefreshCw,
-  TrendingUp, CreditCard, Truck, BarChart3, Settings, Bell, Menu, X,
+  TrendingUp, CreditCard, Truck, BarChart3, Settings, Bell, X,
   Building2, LogOut,
 } from 'lucide-react'
 import SplineBackground from './components/SplineBackground'
+import Topbar from './components/Topbar'
+import ProfilePanel from './components/ProfilePanel'
 import { AuthProvider, useAuth, Role } from './lib/auth'
+import { LocaleProvider } from './lib/locale'
+import { BrandProvider, useBrand } from './lib/brand'
 import Login from './pages/Login'
 
 const Dashboard        = lazy(() => import('./pages/Dashboard'))
@@ -43,6 +47,13 @@ const ADMIN_NAV = [
   { path: '/admin', label: 'Owners', icon: Building2 },
 ]
 
+// Breadcrumb sources. Settings lives in the sidebar footer rather than the nav
+// list, so it has to be named here or its pages would show a bare trail.
+const OWNER_SECTIONS = [...OWNER_NAV.map(({ path, label }) => ({ path, label })),
+  { path: '/owner/settings', label: 'Settings' }]
+const ADMIN_SECTIONS = [...ADMIN_NAV.map(({ path, label }) => ({ path, label })),
+  { path: '/admin/owners', label: 'Owner Detail' }]
+
 /** Where a signed-in user belongs, given their role. */
 function homeFor(role?: Role) {
   return role === 'admin' ? ADMIN_HOME : OWNER_HOME
@@ -57,19 +68,25 @@ function Sidebar({
   showSettings: boolean
 }) {
   const { profile, signOut } = useAuth()
+  const { company, avatarUrl } = useBrand()
+  const [profileOpen, setProfileOpen] = useState(false)
 
-  const displayName = profile?.full_name || profile?.email || 'User'
+  // The card leads with the company name, so this second line carries the role
+  // rather than repeating it.
   const roleLabel = profile?.role === 'admin' ? 'Admin' : 'Owner'
   const homePath = homeFor(profile?.role)
 
   return (
     <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
       <div className="sidebar-logo">
-        <div className="sidebar-logo-icon">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-        </div>
+        <img
+          src="/brand/logo-mark-192.png"
+          alt=""
+          aria-hidden="true"
+          className="brand-mark"
+          width={34}
+          height={34}
+        />
         <span className="sidebar-logo-text">Inventiq</span>
         <button className="sidebar-close-btn" onClick={onClose} aria-label="Close menu"><X size={20} /></button>
       </div>
@@ -112,21 +129,6 @@ function Sidebar({
           </NavLink>
         )}
 
-        <div className="nav-item" style={{ marginTop: 8, cursor: 'default' }}>
-          <div
-            className="nav-item-icon avatar"
-            style={{ background: 'linear-gradient(135deg,#6C63FF,#00D4FF)', borderRadius: '50%', width: 32, height: 32 }}
-          >
-            {displayName.charAt(0).toUpperCase()}
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0 }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {displayName}
-            </span>
-            <span style={{ fontSize: 11, color: 'var(--clr-text-muted)' }}>{roleLabel}</span>
-          </div>
-        </div>
-
         <button
           className="nav-item"
           onClick={() => { onClose(); signOut() }}
@@ -137,6 +139,43 @@ function Sidebar({
           <div className="nav-item-icon"><LogOut size={18} /></div>
           <span className="nav-item-label">Sign Out</span>
         </button>
+
+        {/* Last item in the rail, below Sign Out. The card is the editor for
+            the picture, the company name and the login credentials, so
+            Settings no longer carries a Profile tab. It leads with the company
+            name because that is the identity shown in the top bar. */}
+        <button
+          className="nav-item"
+          onClick={() => setProfileOpen(true)}
+          title="Profile, company and login details"
+          style={{
+            marginTop: 10, paddingTop: 12, background: 'none', width: '100%',
+            cursor: 'pointer', textAlign: 'left',
+            border: 'none', borderTop: '1px solid rgba(255,255,255,0.07)',
+          }}
+        >
+          <div
+            className="nav-item-icon avatar"
+            style={{
+              borderRadius: '50%', width: 32, height: 32, overflow: 'hidden', flexShrink: 0,
+              background: avatarUrl ? '#000' : 'linear-gradient(135deg,#6C63FF,#00D4FF)',
+            }}
+          >
+            {avatarUrl
+              ? <img src={avatarUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              : company.charAt(0).toUpperCase()}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0 }}>
+            <span style={{ fontSize: 12, fontWeight: 600, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {company}
+            </span>
+            <span style={{ fontSize: 11, color: 'var(--clr-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {roleLabel}
+            </span>
+          </div>
+        </button>
+
+        {profileOpen && <ProfilePanel onClose={() => setProfileOpen(false)} />}
       </div>
     </aside>
   )
@@ -173,28 +212,36 @@ function OwnerApp() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   return (
     <div className="app-shell">
-      <button className="mobile-menu-btn" onClick={() => setMobileNavOpen(true)} aria-label="Open menu">
-        <Menu size={20} />
-      </button>
       {mobileNavOpen && <div className="mobile-nav-backdrop" onClick={() => setMobileNavOpen(false)} />}
       <Sidebar mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} navItems={OWNER_NAV} showSettings />
-      <main className="main-content">
-        <Suspense fallback={<PageLoader />}>
-          <Routes>
-            <Route path="/owner"            element={<Dashboard />} />
-            <Route path="/owner/inventory"  element={<Inventory />} />
-            <Route path="/owner/employees"  element={<Employees />} />
-            <Route path="/owner/restock"    element={<Restock />} />
-            <Route path="/owner/forecast"   element={<SalesForecast />} />
-            <Route path="/owner/payment"    element={<Payment />} />
-            <Route path="/owner/logistics"  element={<Logistics />} />
-            <Route path="/owner/statistics" element={<Statistics />} />
-            <Route path="/owner/alerts"     element={<Alerts />} />
-            <Route path="/owner/settings"   element={<SettingsPage />} />
-            <Route path="*"                 element={<Navigate to={OWNER_HOME} replace />} />
-          </Routes>
-        </Suspense>
-      </main>
+      {/* Content column: a fixed top bar that never scrolls, and the page
+          beneath it. The bar owns the bell and the menu button so neither has
+          to be pinned over the page's own header. */}
+      <div className="content-col">
+        <Topbar
+          onMenu={() => setMobileNavOpen(true)}
+          sections={OWNER_SECTIONS}
+          home={OWNER_HOME}
+          showBell
+        />
+        <main className="main-content">
+          <Suspense fallback={<PageLoader />}>
+            <Routes>
+              <Route path="/owner"            element={<Dashboard />} />
+              <Route path="/owner/inventory"  element={<Inventory />} />
+              <Route path="/owner/employees"  element={<Employees />} />
+              <Route path="/owner/restock"    element={<Restock />} />
+              <Route path="/owner/forecast"   element={<SalesForecast />} />
+              <Route path="/owner/payment"    element={<Payment />} />
+              <Route path="/owner/logistics"  element={<Logistics />} />
+              <Route path="/owner/statistics" element={<Statistics />} />
+              <Route path="/owner/alerts"     element={<Alerts />} />
+              <Route path="/owner/settings"   element={<SettingsPage />} />
+              <Route path="*"                 element={<Navigate to={OWNER_HOME} replace />} />
+            </Routes>
+          </Suspense>
+        </main>
+      </div>
     </div>
   )
 }
@@ -204,20 +251,27 @@ function AdminApp() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   return (
     <div className="app-shell">
-      <button className="mobile-menu-btn" onClick={() => setMobileNavOpen(true)} aria-label="Open menu">
-        <Menu size={20} />
-      </button>
       {mobileNavOpen && <div className="mobile-nav-backdrop" onClick={() => setMobileNavOpen(false)} />}
       <Sidebar mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} navItems={ADMIN_NAV} showSettings={false} />
-      <main className="main-content">
-        <Suspense fallback={<PageLoader />}>
-          <Routes>
-            <Route path="/admin"                  element={<AdminOwners />} />
-            <Route path="/admin/owners/:ownerId"  element={<AdminOwnerDetail />} />
-            <Route path="*"                       element={<Navigate to="/admin" replace />} />
-          </Routes>
-        </Suspense>
-      </main>
+      <div className="content-col">
+        {/* No bell here: every notification links into an /owner route, which
+            an admin session is redirected out of. */}
+        <Topbar
+          onMenu={() => setMobileNavOpen(true)}
+          sections={ADMIN_SECTIONS}
+          home={ADMIN_HOME}
+          showBell={false}
+        />
+        <main className="main-content">
+          <Suspense fallback={<PageLoader />}>
+            <Routes>
+              <Route path="/admin"                  element={<AdminOwners />} />
+              <Route path="/admin/owners/:ownerId"  element={<AdminOwnerDetail />} />
+              <Route path="*"                       element={<Navigate to="/admin" replace />} />
+            </Routes>
+          </Suspense>
+        </main>
+      </div>
     </div>
   )
 }
@@ -264,7 +318,15 @@ export default function App() {
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <SplineBackground />
       <AuthProvider>
-        <Root />
+        {/* Inside AuthProvider: the locale is read from app_settings, which
+            RLS scopes to the signed-in session. */}
+        <LocaleProvider>
+          {/* Same reasoning as the locale: the company name and avatar are
+              app_settings rows, so they need a signed-in session to read. */}
+          <BrandProvider>
+            <Root />
+          </BrandProvider>
+        </LocaleProvider>
       </AuthProvider>
     </BrowserRouter>
   )

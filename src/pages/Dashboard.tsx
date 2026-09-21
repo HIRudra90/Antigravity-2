@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '../lib/supabaseClient'
+import { useLocale } from '../lib/locale'
 import { placeRestockOrder, skuFor, COST_RATIO, type EmailVendor } from '../lib/restock'
 import {
   LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -13,13 +14,14 @@ import {
 } from 'lucide-react'
 
 function CustomTooltip({ active, payload, label }: any) {
+  const { symbol } = useLocale()
   if (!active || !payload?.length) return null
   return (
     <div className="custom-tooltip">
       <p style={{ color: 'var(--clr-text-muted)', marginBottom: 6, fontSize: 12 }}>{label}</p>
       {payload.map((p: any) => (
         <p key={p.name} style={{ color: p.color, marginBottom: 2 }}>
-          {p.name}: <strong>{p.name === 'Sales' ? '$' : ''}{p.value.toLocaleString()}</strong>
+          {p.name}: <strong>{p.name === 'Sales' ? symbol : ''}{p.value.toLocaleString()}</strong>
         </p>
       ))}
     </div>
@@ -95,6 +97,7 @@ function QuickRestockModal({ alert, vendors, onClose, onDone }: {
   onClose: () => void
   onDone: (name: string, vendorCompany: string) => void
 }) {
+  const { symbol } = useLocale()
   const matching = vendors.filter(v => v.category === alert.family)
   const [vendorId, setVendorId] = useState(matching[0]?.id ?? vendors[0]?.id ?? '')
   const [qty, setQty] = useState<number>(alert.suggested)
@@ -155,7 +158,7 @@ function QuickRestockModal({ alert, vendors, onClose, onDone }: {
           {[
             { label: 'In Stock', value: String(alert.current_stock), color: '#f43f5e' },
             { label: 'Reorder At', value: String(alert.reorder_level ?? '—'), color: '#f59e0b' },
-            { label: 'Order Total', value: `$${total.toFixed(2)}`, color: '#22d3a8' },
+            { label: 'Order Total', value: `${symbol}${total.toFixed(2)}`, color: '#22d3a8' },
           ].map(s => (
             <div key={s.label} style={{ flex: '1 1 90px', padding: '10px 12px', borderRadius: 9, background: `${s.color}0d`, border: `1px solid ${s.color}22` }}>
               <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', marginBottom: 4 }}>{s.label}</div>
@@ -233,8 +236,8 @@ function StatModal({ card, onClose, data, onRestock, restocked }: {
   onRestock: (a: any) => void
   restocked: Set<string>
 }) {
+  const { symbol, moneyShort: fmt } = useLocale()
   const { rawStats, salesData, recentOrders, alerts } = data
-  const fmt = (v: number) => v >= 1_000_000 ? `$${(v/1_000_000).toFixed(1)}M` : v >= 1000 ? `$${Math.round(v/1000)}k` : `$${v}`
 
   const glowMap: Record<string, string> = {
     orders: '#6C63FF', revenue: '#00D4FF', today: '#22d3a8', lowstock: '#f43f5e',
@@ -296,8 +299,8 @@ function StatModal({ card, onClose, data, onRestock, restocked }: {
                 <BarChart data={salesData} barCategoryGap="35%">
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                   <XAxis dataKey="time" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v/1000}k`} />
-                  <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #6C63FF44', borderRadius: 12, padding: '10px 16px' }} formatter={(v: any) => [`$${(+v).toLocaleString()}`, 'Revenue']} />
+                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${v/1000}k`} />
+                  <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #6C63FF44', borderRadius: 12, padding: '10px 16px' }} formatter={(v: any) => [`${symbol}${(+v).toLocaleString()}`, 'Revenue']} />
                   <Bar dataKey="sales" fill="#6C63FF" radius={[6,6,0,0]} activeBar={{ fill: '#6C63FF', strokeWidth: 0, filter: 'drop-shadow(0 0 8px #6C63FF) brightness(1.3)' }} />
                 </BarChart>
               </ResponsiveContainer>
@@ -340,8 +343,8 @@ function StatModal({ card, onClose, data, onRestock, restocked }: {
                 <LineChart data={salesData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                   <XAxis dataKey="time" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v/1000}k`} />
-                  <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #00D4FF44', borderRadius: 12, padding: '10px 16px' }} formatter={(v: any) => [`$${(+v).toLocaleString()}`, 'Revenue']} />
+                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${v/1000}k`} />
+                  <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #00D4FF44', borderRadius: 12, padding: '10px 16px' }} formatter={(v: any) => [`${symbol}${(+v).toLocaleString()}`, 'Revenue']} />
                   <Line type="monotone" dataKey="sales" stroke="#00D4FF" strokeWidth={3} dot={{ fill: '#00D4FF', r: 5, stroke: '#fff', strokeWidth: 1 }} activeDot={{ r: 8, stroke: '#fff', strokeWidth: 2, filter: 'drop-shadow(0 0 10px #00D4FF)' }} name="Revenue" />
                 </LineChart>
               </ResponsiveContainer>
@@ -384,8 +387,8 @@ function StatModal({ card, onClose, data, onRestock, restocked }: {
                 <BarChart data={salesData} barCategoryGap="35%">
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                   <XAxis dataKey="time" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v/1000}k`} />
-                  <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #22d3a844', borderRadius: 12, padding: '10px 16px' }} formatter={(v: any) => [`$${(+v).toLocaleString()}`, 'Revenue']} />
+                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${v/1000}k`} />
+                  <Tooltip cursor={false} contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #22d3a844', borderRadius: 12, padding: '10px 16px' }} formatter={(v: any) => [`${symbol}${(+v).toLocaleString()}`, 'Revenue']} />
                   <Bar dataKey="sales" radius={[6,6,0,0]} activeBar={{ strokeWidth: 0, filter: 'drop-shadow(0 0 8px #22d3a8) brightness(1.3)' }}>
                     {salesData.map((_, i) => (
                       <Cell key={i} fill={i === salesData.length - 1 ? '#22d3a8' : 'rgba(34,211,168,0.4)'} />
@@ -417,7 +420,7 @@ function StatModal({ card, onClose, data, onRestock, restocked }: {
               {/* There is no stock-level history table, so a real month-over-month
                   comparison is not available. Show what restocking everything on
                   this list would actually cost instead of inventing a trend. */}
-              <MiniCard label="Restock Cost" value={`$${Math.round(restockCost).toLocaleString()}`} color="#22d3a8" />
+              <MiniCard label="Restock Cost" value={`${symbol}${Math.round(restockCost).toLocaleString()}`} color="#22d3a8" />
             </div>
             {alerts.length > 0 ? (
               <>
@@ -465,6 +468,7 @@ function StatModal({ card, onClose, data, onRestock, restocked }: {
 }
 
 export default function Dashboard() {
+  const { symbol, moneyShort, fmtDate, fmtTime } = useLocale()
   const [salesData, setSalesData] = useState<any[]>([])
   const [recentOrders, setRecentOrders] = useState<any[]>([])
   const [alerts, setAlerts] = useState<any[]>([])
@@ -544,14 +548,44 @@ export default function Dashboard() {
     if (!silent) setLoading(true)
     try {
       const today = new Date().toISOString().split('T')[0]
-      const { data: sales, error: salesError } = await supabase
+
+      // Two bounded reads replace what used to be "pull the whole sales table
+      // and count it in JS". That read was capped at PostgREST's 1000-row
+      // ceiling, so every total was computed from a slice of the table.
+      //
+      // The recent list also needs `id` as a tie-break: sale_date is a DATE,
+      // so a day's worth of rows all compare equal and Postgres returns them
+      // in whatever order it likes. A just-placed order sat somewhere in the
+      // middle of today's ties and never reached the top 5.
+      //
+      // The overview is fetched first rather than alongside, because it
+      // carries the accounting epoch and the recent-orders query needs it as
+      // a server-side filter. Trimming those rows client-side would not work:
+      // .limit(5) is applied before the response is sent, so filtering after
+      // the fact can only shrink an already truncated list — five pre-reset
+      // orders in, nothing out, even with newer sales further down the table.
+      const overviewRes = await supabase.rpc('get_sales_overview')
+      if (overviewRes.error) throw overviewRes.error
+
+      const ov: any = Array.isArray(overviewRes.data) ? overviewRes.data[0] : overviewRes.data
+
+      // Falling back to the epoch (rather than to "no filter") keeps a missing
+      // value from silently readmitting the entire sales history.
+      const epoch = ov?.opened_at ?? new Date(0).toISOString()
+
+      const recentRes = await supabase
         .from('sales_transactions')
         .select(`id, sale_date, quantity_sold, on_promotion, products (name, unit_price, family)`)
+        .gte('created_at', epoch)
         .order('sale_date', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(5)
 
-      if (salesError) throw salesError
+      if (recentRes.error) throw recentRes.error
 
-      if (sales) {
+      const recent = recentRes.data
+
+      if (recent && ov) {
         const { data: dailyRev } = await supabase.rpc('get_daily_revenue', { days_back: 6 })
         const dateRevMap: Record<string, number> = {}
         if (dailyRev) (dailyRev as any[]).forEach((r: any) => { dateRevMap[r.sale_date] = Number(r.revenue) })
@@ -563,7 +597,7 @@ export default function Dashboard() {
         })
         setSalesData(chartData)
 
-        setRecentOrders(sales.slice(0, 5).map((s: any) => {
+        setRecentOrders(recent.map((s: any) => {
           const product = Array.isArray(s.products) ? s.products[0] : s.products
           const unitPrice = Number(product?.unit_price) || 0
           return {
@@ -572,43 +606,33 @@ export default function Dashboard() {
             family: product?.family || '—',
             quantity: s.quantity_sold,
             unitPrice,
-            amount: `$${(s.quantity_sold * unitPrice).toLocaleString()}`,
+            amount: `${symbol}${(s.quantity_sold * unitPrice).toLocaleString()}`,
             promo: !!s.on_promotion,
             status: 'Completed',
             date: s.sale_date === today ? 'Today' : s.sale_date,
           }
         }))
 
-        const totalRevenue = sales.reduce((acc: number, s: any) => {
-          const product = Array.isArray(s.products) ? s.products[0] : s.products
-          return acc + (s.quantity_sold * (product?.unit_price || 0))
-        }, 0)
-        const ordersToday = sales.filter((s: any) => s.sale_date === today).length
-
         // ── Real period-over-period deltas ──────────────────────────
-        // Every one of these used to be a hardcoded string ("+14.2%", "-5").
-        // They are now measured off the same sales rows the cards report.
-        const priceOf = (s: any) => {
-          const p = Array.isArray(s.products) ? s.products[0] : s.products
-          return Number(p?.unit_price) || 0
-        }
-        const now = new Date()
-        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0]
-        const prevStart = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString().split('T')[0]
-        const yesterday = new Date(now.getTime() - 86_400_000).toISOString().split('T')[0]
-
-        const thisMonth = sales.filter((s: any) => s.sale_date >= monthStart)
-        const lastMonth = sales.filter((s: any) => s.sale_date >= prevStart && s.sale_date < monthStart)
-        const revOf = (rows: any[]) => rows.reduce((a, s) => a + s.quantity_sold * priceOf(s), 0)
+        // Measured in SQL over the whole table. The month boundaries come
+        // from the database clock too, so the comparison can't drift from
+        // the dates the rows were actually written with.
+        const totalOrders = Number(ov.total_orders) || 0
+        const totalRevenue = Number(ov.total_revenue) || 0
+        const ordersToday = Number(ov.orders_today) || 0
+        const ordersYesterday = Number(ov.orders_yesterday) || 0
+        const ordersThisMonth = Number(ov.orders_this_month) || 0
+        const ordersLastMonth = Number(ov.orders_last_month) || 0
+        const revenueThisMonth = Number(ov.revenue_this_month) || 0
+        const revenueLastMonth = Number(ov.revenue_last_month) || 0
 
         // With no prior month to compare against, a percentage would be
         // meaningless — say "no prior month" rather than print a number.
         const pctChange = (curr: number, prev: number) =>
           prev > 0 ? `${curr >= prev ? '+' : ''}${(((curr - prev) / prev) * 100).toFixed(1)}%` : null
 
-        const orderPct = pctChange(thisMonth.length, lastMonth.length)
-        const revPct = pctChange(revOf(thisMonth), revOf(lastMonth))
-        const ordersYesterday = sales.filter((s: any) => s.sale_date === yesterday).length
+        const orderPct = pctChange(ordersThisMonth, ordersLastMonth)
+        const revPct = pctChange(revenueThisMonth, revenueLastMonth)
         const todayDelta = ordersToday - ordersYesterday
 
         const { data: invData } = await supabase
@@ -618,18 +642,23 @@ export default function Dashboard() {
         const outOfStock = actualLowStock.filter((i: any) => i.current_stock === 0).length
 
         setRawStats({
-          totalOrders: sales.length, revenue: Math.round(totalRevenue), ordersToday,
+          totalOrders, revenue: totalRevenue, ordersToday,
           lowStockCount: actualLowStock.length,
-          ordersThisMonth: thisMonth.length, ordersLastMonth: lastMonth.length,
-          revenueThisMonth: Math.round(revOf(thisMonth)), revenueLastMonth: Math.round(revOf(lastMonth)),
+          ordersThisMonth, ordersLastMonth,
+          revenueThisMonth, revenueLastMonth,
           ordersYesterday, outOfStock, orderPct, revPct,
         })
 
         setStats([
-          { id: 'orders',   label: 'Total Orders',    value: sales.length.toLocaleString(),
+          { id: 'orders',   label: 'Total Orders',    value: totalOrders.toLocaleString(),
             change: orderPct ?? 'no prior month', up: (orderPct ?? '+').startsWith('+'), suffix: orderPct ? 'vs last month' : '',
             icon: ShoppingCart, color: '#6C63FF' },
-          { id: 'revenue',  label: 'Revenue',         value: `$${Math.round(totalRevenue/1000)}K`,
+          // Always-K formatting was fine while the total was capped at 1000
+          // rows; against the real figure it reads "$434158K".
+          { id: 'revenue',  label: 'Revenue',
+            value: totalRevenue >= 1_000_000
+              ? `${symbol}${(totalRevenue / 1_000_000).toFixed(1)}M`
+              : `${symbol}${Math.round(totalRevenue / 1000)}K`,
             change: revPct ?? 'no prior month', up: (revPct ?? '+').startsWith('+'), suffix: revPct ? 'vs last month' : '',
             icon: DollarSign, color: '#00D4FF' },
           { id: 'today',    label: 'Orders Today',    value: ordersToday.toString(),
@@ -681,7 +710,7 @@ export default function Dashboard() {
 
   return (
     <div className="page-enter">
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div className="page-header page-header-row">
         <div>
           <h1>Operational Dashboard</h1>
           <p>
@@ -689,7 +718,7 @@ export default function Dashboard() {
             {liveAt && (
               <span style={{ marginLeft: 10, display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#22d3a8' }}>
                 <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#22d3a8', boxShadow: '0 0 8px #22d3a8' }} />
-                live · updated {liveAt.toLocaleTimeString()}
+                live · updated {fmtTime(liveAt)}
               </span>
             )}
           </p>
@@ -777,10 +806,10 @@ export default function Dashboard() {
               { label: 'Product',    value: selectedOrder.product,                         color: 'rgba(255,255,255,0.7)' },
               { label: 'Category',   value: selectedOrder.family,                           color: '#00D4FF' },
               { label: 'Quantity',   value: `${selectedOrder.quantity} units`,              color: '#fff' },
-              { label: 'Unit Price', value: `$${(selectedOrder.unitPrice ?? 0).toFixed(2)}`, color: '#fff' },
+              { label: 'Unit Price', value: `${symbol}${(selectedOrder.unitPrice ?? 0).toFixed(2)}`, color: '#fff' },
               { label: 'Amount',     value: selectedOrder.amount,                           color: '#22d3a8' },
               { label: 'Promotion',  value: selectedOrder.promo ? 'Yes — sold on promo' : 'No', color: selectedOrder.promo ? '#f59e0b' : 'rgba(255,255,255,0.4)' },
-              { label: 'Date',       value: selectedOrder.date ? new Date(selectedOrder.date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : '—', color: 'rgba(255,255,255,0.5)' },
+              { label: 'Date',       value: selectedOrder.date ? fmtDate(selectedOrder.date, { year: 'numeric', month: 'long', day: 'numeric' }) : '—', color: 'rgba(255,255,255,0.5)' },
             ].map(row => (
               <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 0', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
                 <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>{row.label}</span>
@@ -857,7 +886,7 @@ export default function Dashboard() {
             <LineChart data={salesData}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
               <XAxis dataKey="time" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v/1000}k`} />
+              <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${v/1000}k`} />
               <Tooltip content={<CustomTooltip />} />
               <Line type="monotone" dataKey="sales" stroke="#00D4FF" strokeWidth={3} dot={{ fill: '#00D4FF', strokeWidth: 2, r: 4 }} activeDot={{ r: 7, stroke: '#fff', strokeWidth: 1.5, filter: 'drop-shadow(0 0 10px #00D4FF)' }} name="Sales" connectNulls />
             </LineChart>

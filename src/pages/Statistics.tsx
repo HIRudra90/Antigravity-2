@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '../lib/supabaseClient'
+import { useLocale } from '../lib/locale'
+import { useLiveData } from '../lib/useLiveData'
 import {
   BarChart, Bar, LineChart, Line,
   XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -9,7 +11,9 @@ import {
 import { TrendingUp, Activity, DollarSign, Package, RefreshCw, X, TrendingDown, ChevronDown, ChevronUp } from 'lucide-react'
 
 const COLORS = ['#6C63FF', '#00D4FF', '#22d3a8', '#f59e0b', '#f43f5e', '#ec4899']
-const fmt = (v: number) => v >= 1_000_000 ? `$${(v/1_000_000).toFixed(1)}M` : v >= 1000 ? `$${Math.round(v/1000)}k` : `$${v}`
+// `fmt` used to live here as a module constant with a hardcoded '$'. It is now
+// taken from the locale inside each component, so changing the currency in
+// Settings re-renders these figures instead of leaving them stale.
 
 // Reusable glowing mini-card
 function MiniCard({ label, value, color }: { label: string; value: string; color: string }) {
@@ -83,6 +87,7 @@ function StatModal({ card, onClose, data }: {
     categoryContribution: any[]; comparisonActual: any[]; dailyRevenue: any[]
   }
 }) {
+  const { symbol, moneyShort: fmt } = useLocale()
   const { stats, revenueGrowth, profitTrend, topSelling, categoryContribution, comparisonActual, dailyRevenue } = data
   const [expandedPeriod, setExpandedPeriod] = useState<string | null>(null)
 
@@ -175,8 +180,8 @@ function StatModal({ card, onClose, data }: {
                 <LineChart data={revenueGrowth}>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                   <XAxis dataKey="q" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `$${(v/1_000_000).toFixed(0)}M`} />
-                  <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #6C63FF44', borderRadius: 10 }} formatter={(v: any) => [`$${(+v).toLocaleString()}`, 'Revenue']} />
+                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${(v/1_000_000).toFixed(0)}M`} />
+                  <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #6C63FF44', borderRadius: 10 }} formatter={(v: any) => [`${symbol}${(+v).toLocaleString()}`, 'Revenue']} />
                   <Line type="monotone" dataKey="revenue" stroke="#6C63FF" strokeWidth={3} dot={{ fill: '#6C63FF', r: 5, stroke: '#fff', strokeWidth: 1 }} activeDot={{ r: 8, stroke: '#fff', strokeWidth: 2, filter: 'drop-shadow(0 0 10px #6C63FF)' }} connectNulls />
                 </LineChart>
               </ResponsiveContainer>
@@ -227,8 +232,8 @@ function StatModal({ card, onClose, data }: {
                 <LineChart data={profitTrend}>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                   <XAxis dataKey="month" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `$${(v/1_000_000).toFixed(0)}M`} />
-                  <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #22d3a844', borderRadius: 10 }} formatter={(v: any) => [`$${(+v).toLocaleString()}`, 'Net Profit']} />
+                  <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${(v/1_000_000).toFixed(0)}M`} />
+                  <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid #22d3a844', borderRadius: 10 }} formatter={(v: any) => [`${symbol}${(+v).toLocaleString()}`, 'Net Profit']} />
                   <Line type="monotone" dataKey="profit" stroke="#22d3a8" strokeWidth={3} dot={{ fill: '#22d3a8', r: 5, stroke: '#fff', strokeWidth: 1 }} activeDot={{ r: 8, stroke: '#fff', strokeWidth: 2, filter: 'drop-shadow(0 0 10px #22d3a8)' }} connectNulls />
                 </LineChart>
               </ResponsiveContainer>
@@ -329,7 +334,7 @@ function StatModal({ card, onClose, data }: {
                       <BarChart data={periodData} margin={{ top: 10, left: 10, right: 10 }} barCategoryGap="35%">
                         <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
                         <XAxis dataKey="label" tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 11, fontWeight: 600 }} axisLine={false} tickLine={false} />
-                        <YAxis tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => v >= 1_000_000 ? `$${(v/1_000_000).toFixed(0)}M` : v >= 1000 ? `$${Math.round(v/1000)}k` : `$${v}`} />
+                        <YAxis tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => v >= 1_000_000 ? `${symbol}${(v/1_000_000).toFixed(0)}M` : v >= 1000 ? `${symbol}${Math.round(v/1000)}k` : `${symbol}${v}`} />
                         <Tooltip
                           cursor={{ fill: 'rgba(255,255,255,0.04)' }}
                           contentStyle={{ background: 'rgba(5,8,16,0.96)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 12, padding: '10px 16px' }}
@@ -454,6 +459,7 @@ function StatModal({ card, onClose, data }: {
 }
 
 export default function Statistics() {
+  const { symbol, moneyShort: fmt } = useLocale()
   const [loading, setLoading] = useState(true)
   const [revenueGrowth, setRevenueGrowth] = useState<any[]>([])
   const [profitTrend, setProfitTrend] = useState<any[]>([])
@@ -471,8 +477,10 @@ export default function Statistics() {
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  async function fetchStats() {
-    setLoading(true)
+  useLiveData('statistics-live', ['sales_transactions', 'inventory'], () => fetchStats({ silent: true }))
+
+  async function fetchStats({ silent = false }: { silent?: boolean } = {}) {
+    if (!silent) setLoading(true)
     try {
       const [
         { data: monthly },
@@ -533,7 +541,7 @@ export default function Statistics() {
     } catch (err) {
       console.error('Error fetching statistics:', err)
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }
 
@@ -548,12 +556,12 @@ export default function Statistics() {
 
   return (
     <div className="page-enter">
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div className="page-header page-header-row">
         <div>
           <h1>Business Analytics</h1>
           <p>Live revenue, profit, and product performance from your sales data</p>
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={fetchStats}><RefreshCw size={14} /> Refresh</button>
+        <button className="btn btn-ghost btn-sm" onClick={() => fetchStats()}><RefreshCw size={14} /> Refresh</button>
       </div>
 
       <div className="stat-grid">
@@ -594,8 +602,8 @@ export default function Statistics() {
               <LineChart data={revenueGrowth}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                 <XAxis dataKey="q" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v/1000}k`} />
-                <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} formatter={(v: any) => `$${(+v).toLocaleString()}`} />
+                <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${v/1000}k`} />
+                <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} formatter={(v: any) => `${symbol}${(+v).toLocaleString()}`} />
                 <Line type="monotone" dataKey="revenue" stroke="#6C63FF" strokeWidth={3} dot={{ fill: '#6C63FF', r: 4 }} activeDot={{ r: 7, stroke: '#fff', strokeWidth: 1.5, filter: 'drop-shadow(0 0 10px #6C63FF)' }} name="Revenue" connectNulls />
               </LineChart>
             </ResponsiveContainer>
@@ -608,8 +616,8 @@ export default function Statistics() {
               <LineChart data={profitTrend}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                 <XAxis dataKey="month" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v/1000}k`} />
-                <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} formatter={(v: any) => `$${(+v).toLocaleString()}`} />
+                <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${v/1000}k`} />
+                <Tooltip contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} formatter={(v: any) => `${symbol}${(+v).toLocaleString()}`} />
                 <Line type="monotone" dataKey="profit" stroke="#22d3a8" strokeWidth={3} dot={{ fill: '#22d3a8', r: 3 }} activeDot={{ r: 7, stroke: '#fff', strokeWidth: 1.5, filter: 'drop-shadow(0 0 10px #22d3a8)' }} name="Net Profit" connectNulls />
               </LineChart>
             </ResponsiveContainer>
@@ -663,8 +671,8 @@ export default function Statistics() {
               <BarChart data={comparisonActual} margin={{ top: 20 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                 <XAxis dataKey="period" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v/1000}k`} />
-                <Tooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} formatter={(v: any) => `$${(+v).toLocaleString()}`} />
+                <YAxis tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `${symbol}${v/1000}k`} />
+                <Tooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} contentStyle={{ background: 'rgba(5,8,16,0.95)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 12, padding: '10px 16px', boxShadow: '0 12px 32px rgba(0,0,0,0.6)' }} labelStyle={{ color: '#fff', fontWeight: 700, fontSize: 13, marginBottom: 4 }} itemStyle={{ fontSize: 12, fontWeight: 600 }} formatter={(v: any) => `${symbol}${(+v).toLocaleString()}`} />
                 <Legend wrapperStyle={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }} />
                 <Bar dataKey="lastWeek"  name="Last 7 Days"   fill="#f59e0b" radius={[3,3,0,0]} activeBar={{ stroke: '#fff', strokeWidth: 1, fill: '#fbbf24', filter: 'drop-shadow(0px 0px 8px #f59e0b)' }} />
                 <Bar dataKey="lastMonth" name="Last 30 Days"  fill="#00D4FF" radius={[3,3,0,0]} activeBar={{ stroke: '#fff', strokeWidth: 1, fill: '#45e3ff', filter: 'drop-shadow(0px 0px 8px #00D4FF)' }} />

@@ -2,16 +2,24 @@ import { useState, useEffect } from 'react'
 import {
   User, Monitor, Package, Zap, CreditCard, Truck, Bell, Shield,
   UploadCloud, Save, Calendar, DollarSign,
-  ShoppingCart, Shuffle, Edit3, Check, RefreshCw, AlertTriangle, ChevronDown
+  ShoppingCart, Shuffle, Edit3, Check, RefreshCw, AlertTriangle, ChevronDown,
+  Building2
 } from 'lucide-react'
 import GlassSelect from '../components/GlassSelect'
 import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../lib/auth'
+import { useLocale, CURRENCIES, TIMEZONES } from '../lib/locale'
+import { NOTIFICATION_CATEGORIES } from '../lib/notifications'
+import { backendFetch, describeBackendError, ModelStatus } from '../lib/backend'
 
+// Profile moved out: the picture, company name and login credentials are now
+// edited from the profile card at the bottom of the sidebar, which is where
+// they are displayed. Two editors for one set of values meant whichever was
+// opened second showed stale text.
 const TABS = [
-  { id: 'profile',       label: 'Profile',           icon: User },
   { id: 'system',        label: 'System',             icon: Monitor },
   { id: 'salary',        label: 'Salary / Auto-Pay',  icon: DollarSign },
+  { id: 'vendorpay',     label: 'Vendor Auto-Pay',    icon: Building2 },
   { id: 'inventory',     label: 'Inventory',          icon: Package },
   { id: 'ai',            label: 'AI Settings',        icon: Zap },
   { id: 'payments',      label: 'Payments',           icon: CreditCard },
@@ -19,6 +27,29 @@ const TABS = [
   { id: 'notifications', label: 'Notifications',      icon: Bell },
   { id: 'security',      label: 'Security',           icon: Shield },
 ]
+
+// The only horizons /api/predict/pipeline accepts. The old Daily/Weekly/Monthly
+// dropdown matched none of them, which is why changing it never did anything.
+export const FORECAST_PERIODS = [
+  { value: '7d',   label: '7 Days',  days: 7 },
+  { value: '30d',  label: '30 Days', days: 30 },
+  { value: '90d',  label: '90 Days', days: 90 },
+  { value: '365d', label: '1 Year',  days: 365 },
+]
+
+type AgentKind = 'restock' | 'payroll' | 'vendorpay'
+
+// Every switch that can start an agent, per agent.
+//
+// Payroll and vendor pay are each gated by TWO settings: the agent master
+// switch and the user-facing auto-pay toggle. Both have to move together —
+// when the agent card wrote only the master switch, turning it on here left
+// auto-pay off, so the card read "● ACTIVE" while nothing ever ran.
+const AGENT_KEYS: Record<AgentKind, string[]> = {
+  restock:   ['agent_restock_enabled'],
+  payroll:   ['agent_payroll_enabled',    'auto_pay_enabled'],
+  vendorpay: ['agent_vendor_pay_enabled', 'auto_vendor_pay_enabled'],
+}
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void }) {
   return (
@@ -38,13 +69,12 @@ function SaveBar({ saving, saved, onSave, label = 'Save Settings' }: { saving: b
 
 export default function Settings() {
   const { profile } = useAuth()
+  const locale = useLocale()
+  const { fmtDate, fmtDateTime } = locale
   const ownerId = profile?.owner_id ?? null
-  const [activeTab, setActiveTab] = useState('profile')
-
-  // ── Profile ──────────────────────────────────────────────────────────────────
-  const [profileName,    setProfileName]    = useState('Hasidul Islam')
-  const [profileEmail,   setProfileEmail]   = useState('admin@stockmind.ai')
-  const [profileCompany, setProfileCompany] = useState('Antigravity Inc.')
+  // 'system' is the first tab now that Profile has moved to the sidebar card;
+  // defaulting to the removed id would have opened this page on a blank panel.
+  const [activeTab, setActiveTab] = useState('system')
 
   // ── System ───────────────────────────────────────────────────────────────────
   const [systemCurrency, setSystemCurrency] = useState('USD')
@@ -54,14 +84,21 @@ export default function Settings() {
   // ── AI ───────────────────────────────────────────────────────────────────────
   const [aiEnabled,    setAiEnabled]    = useState(true)
   const [autoRecom,    setAutoRecom]    = useState(true)
-  const [aiModelType,  setAiModelType]  = useState('Regression')
-  const [aiInterval,   setAiInterval]   = useState('Weekly')
   const [aiConfidence, setAiConfidence] = useState(85)
+  // The horizon sent to /api/predict/pipeline. The old "Prediction Interval"
+  // (Daily/Weekly/Monthly) matched nothing the backend accepts, so it could
+  // never have taken effect; these four values are the contract.
+  const [aiForecastPeriod, setAiForecastPeriod] = useState('30d')
+  const [modelStatus,        setModelStatus]        = useState<any>(null)
+  const [modelStatusErr,     setModelStatusErr]     = useState<string | null>(null)
+  const [modelStatusLoading, setModelStatusLoading] = useState(false)
 
-  // ── Autonomous Agents (restock + payroll) ───────────────────────────────────
+  // ── Autonomous Agents (restock + payroll + vendor payment) ──────────────────
+  // Payroll and vendor pay have no separate "agent enabled" state: their cards
+  // read the very same booleans as their settings pages (autoPayEnabled /
+  // vendorPayEnabled), so the two screens cannot drift apart.
   const [restockAgentEnabled, setRestockAgentEnabled] = useState(false)
-  const [payrollAgentEnabled, setPayrollAgentEnabled] = useState(false)
-  const [agentToggleBusy, setAgentToggleBusy] = useState<'restock' | 'payroll' | null>(null)
+  const [agentToggleBusy, setAgentToggleBusy] = useState<AgentKind | null>(null)
   const [agentRuns, setAgentRuns] = useState<any[]>([])
 
   // ── Payments ─────────────────────────────────────────────────────────────────
@@ -75,18 +112,33 @@ export default function Settings() {
   const [autoShipping,      setAutoShipping]      = useState(false)
 
   // ── Notifications ────────────────────────────────────────────────────────────
-  const [notifLowStock,  setNotifLowStock]  = useState(true)
-  const [notifPayments,  setNotifPayments]  = useState(true)
-  const [notifLogistics, setNotifLogistics] = useState(true)
-  const [notifAI,        setNotifAI]        = useState(true)
-  const [notifEmail,     setNotifEmail]     = useState(true)
-  const [notifSMS,       setNotifSMS]       = useState(false)
+  // One switch per real event category (see migration 016). The old six keys
+  // were read by nothing, and two of them described delivery channels that do
+  // not exist in this project.
+  const [notifCats, setNotifCats] = useState<Record<string, boolean>>({
+    inventory: true, procurement: true, payment: true, agent: true,
+  })
+  const [notifCounts, setNotifCounts] = useState<Record<string, number>>({})
 
   // ── Salary / Auto-Pay ────────────────────────────────────────────────────────
   const [autoPayEnabled,         setAutoPayEnabled]         = useState(false)
   const [autoPayDay,             setAutoPayDay]             = useState(1)
   const [salarySettingsLoading,  setSalarySettingsLoading]  = useState(true)
   const [salarySettingsSaved,    setSalarySettingsSaved]    = useState(false)
+  const [payrollPreview,         setPayrollPreview]         = useState<any>(null)
+  const [payrollRunning,         setPayrollRunning]         = useState(false)
+  const [payrollRunConfirm,      setPayrollRunConfirm]      = useState(false)
+  const [payrollRunResult,       setPayrollRunResult]       = useState<string | null>(null)
+
+  // ── Vendor Auto-Pay ──────────────────────────────────────────────────────────
+  const [vendorPayEnabled,       setVendorPayEnabled]       = useState(false)
+  const [vendorPayDay,           setVendorPayDay]           = useState(1)
+  const [vendorSettingsLoading,  setVendorSettingsLoading]  = useState(false)
+  const [vendorSettingsSaved,    setVendorSettingsSaved]    = useState(false)
+  const [vendorPreview,          setVendorPreview]          = useState<any>(null)
+  const [vendorRunning,          setVendorRunning]          = useState(false)
+  const [vendorRunConfirm,       setVendorRunConfirm]       = useState(false)
+  const [vendorRunResult,        setVendorRunResult]        = useState<string | null>(null)
 
   // ── Inventory sub-tab ────────────────────────────────────────────────────────
   const [invSubTab,    setInvSubTab]    = useState<'sale' | 'stock'>('sale')
@@ -131,25 +183,40 @@ export default function Settings() {
         const get = (key: string, fallback: string) =>
           (data as any[]).find(s => s.setting_key === key)?.setting_value ?? fallback
 
-        setAutoPayEnabled(get('auto_pay_enabled', 'false') === 'true')
+        // Both gates, same as vendor auto-pay: the visible toggle must not
+        // read "on" while the master agent switch quietly blocks every run.
+        setAutoPayEnabled(
+          get('auto_pay_enabled', 'false') === 'true' &&
+          get('agent_payroll_enabled', 'false') === 'true'
+        )
         setAutoPayDay(parseInt(get('auto_pay_day', '1')) || 1)
 
-        setProfileName(get('profile_name', 'Hasidul Islam'))
-        setProfileEmail(get('profile_email', 'admin@stockmind.ai'))
-        setProfileCompany(get('profile_company', 'Antigravity Inc.'))
+        // Vendor auto-pay needs both switches on, and the visible toggle
+        // reflects that — otherwise the UI could read "on" while the master
+        // agent switch quietly keeps it from ever running.
+        setVendorPayEnabled(
+          get('auto_vendor_pay_enabled', 'false') === 'true' &&
+          get('agent_vendor_pay_enabled', 'false') === 'true'
+        )
+        setVendorPayDay(parseInt(get('auto_vendor_pay_day', '1')) || 1)
 
+        // profile_* keys are read by BrandProvider now, not here.
         setSystemCurrency(get('system_currency', 'USD'))
         setSystemTimezone(get('system_timezone', 'MY'))
         setSystemBusiness(get('system_business', 'Retail'))
 
         setAiEnabled(get('ai_enabled', 'true') === 'true')
-        setAiModelType(get('ai_model_type', 'Regression'))
-        setAiInterval(get('ai_interval', 'Weekly'))
+        // Tolerate the legacy 'Weekly'/'Monthly' values: anything that is not
+        // one of the four supported horizons falls back to 30d.
+        const period = get('ai_forecast_period', '30d')
+        setAiForecastPeriod(FORECAST_PERIODS.some(p => p.value === period) ? period : '30d')
         setAiConfidence(parseInt(get('ai_confidence', '85')) || 85)
         setAutoRecom(get('ai_auto_suggestions', 'true') === 'true')
 
+        // Payroll and vendor-pay agent state is not loaded separately — their
+        // cards read autoPayEnabled / vendorPayEnabled, set above from both
+        // gates, so one source of truth serves both screens.
         setRestockAgentEnabled(get('agent_restock_enabled', 'false') === 'true')
-        setPayrollAgentEnabled(get('agent_payroll_enabled', 'false') === 'true')
 
         setPaymentStripe(get('payment_stripe', 'true') === 'true')
         setPaymentACH(get('payment_ach', 'true') === 'true')
@@ -158,22 +225,53 @@ export default function Settings() {
         setLogisticsProvider(get('logistics_provider', 'DHL'))
         setAutoShipping(get('logistics_auto_shipping', 'false') === 'true')
 
-        setNotifLowStock(get('notif_low_stock', 'true') === 'true')
-        setNotifPayments(get('notif_payments', 'true') === 'true')
-        setNotifLogistics(get('notif_logistics', 'true') === 'true')
-        setNotifAI(get('notif_ai', 'true') === 'true')
-        setNotifEmail(get('notif_email', 'true') === 'true')
-        setNotifSMS(get('notif_sms', 'false') === 'true')
+        setNotifCats(Object.fromEntries(
+          NOTIFICATION_CATEGORIES.map(c => [c.key, get(`notif_${c.key}`, 'true') === 'true']),
+        ))
       }
       setSalarySettingsLoading(false)
     }
     loadSettings()
     fetchAgentRuns()
+    loadVendorPreview()
+    loadPayrollPreview()
   }, [])
 
   useEffect(() => {
     if (activeTab === 'inventory' && invProducts.length === 0) loadInvProducts()
+    if (activeTab === 'vendorpay') loadVendorPreview()
+    if (activeTab === 'salary') loadPayrollPreview()
+    if (activeTab === 'ai' && !modelStatus) loadModelStatus()
+    if (activeTab === 'notifications') loadNotifCounts()
   }, [activeTab])
+
+  async function loadVendorPreview() {
+    const { data } = await supabase.rpc('vendor_autopay_preview')
+    setVendorPreview(Array.isArray(data) ? data[0] : data)
+  }
+
+  async function loadPayrollPreview() {
+    const { data } = await supabase.rpc('payroll_autopay_preview')
+    setPayrollPreview(Array.isArray(data) ? data[0] : data)
+  }
+
+  // Which model binaries actually loaded on the backend. Both loaders treat a
+  // missing file as a soft failure and fall through to a statistical policy,
+  // so the panel reports what is really running rather than asserting it.
+  // Retries through a cold start: the Space sleeps when idle, and one probe
+  // against a booting server is not evidence the backend is down.
+  async function loadModelStatus() {
+    setModelStatusLoading(true)
+    try {
+      setModelStatus(await backendFetch<ModelStatus>('/api/model-status', { timeoutMs: 20_000, retries: 3 }))
+      setModelStatusErr(null)
+    } catch (e: any) {
+      setModelStatus(null)
+      setModelStatusErr(describeBackendError(e))
+    } finally {
+      setModelStatusLoading(false)
+    }
+  }
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
   async function upsertSettings(pairs: [string, string][], setSaving: (v: boolean) => void, setSaved: (v: boolean) => void) {
@@ -187,18 +285,23 @@ export default function Settings() {
     setTimeout(() => setSaved(false), 2500)
   }
 
-  // Agent toggles persist immediately — these gate live Edge Functions, so
-  // there's no separate "Save" step like the rest of this page.
-  async function toggleAgent(kind: 'restock' | 'payroll', next: boolean) {
+  // Agent toggles persist immediately — these gate live automation, so there's
+  // no separate "Save" step like the rest of this page.
+  async function toggleAgent(kind: AgentKind, next: boolean) {
     setAgentToggleBusy(kind)
-    const key = kind === 'restock' ? 'agent_restock_enabled' : 'agent_payroll_enabled'
+    const value = next ? 'true' : 'false'
     const { error } = await supabase.from('app_settings').upsert(
-      { setting_key: key, setting_value: next ? 'true' : 'false', updated_at: new Date().toISOString() },
+      AGENT_KEYS[kind].map(setting_key => ({
+        setting_key, setting_value: value, updated_at: new Date().toISOString(),
+      })),
       { onConflict: 'setting_key' }
     )
     if (!error) {
+      // The settings pages share these booleans, so they follow along without
+      // a reload and the "Next run" figures re-read immediately.
       if (kind === 'restock') setRestockAgentEnabled(next)
-      else setPayrollAgentEnabled(next)
+      else if (kind === 'payroll') { setAutoPayEnabled(next); await loadPayrollPreview() }
+      else { setVendorPayEnabled(next); await loadVendorPreview() }
     }
     setAgentToggleBusy(null)
   }
@@ -208,17 +311,17 @@ export default function Settings() {
     setAgentRuns(data || [])
   }
 
-  const saveProfile  = () => upsertSettings([
-    ['profile_name', profileName], ['profile_email', profileEmail], ['profile_company', profileCompany]
-  ], setProfileSaving, setProfileSaved)
 
   const saveSystem   = () => upsertSettings([
     ['system_currency', systemCurrency], ['system_timezone', systemTimezone], ['system_business', systemBusiness]
   ], setSystemSaving, setSystemSaved)
 
   const saveAI       = () => upsertSettings([
-    ['ai_enabled', aiEnabled.toString()], ['ai_model_type', aiModelType],
-    ['ai_interval', aiInterval], ['ai_confidence', aiConfidence.toString()],
+    ['ai_enabled', aiEnabled.toString()],
+    // The engine is not a choice — it is whatever loaded on the backend — so
+    // it is recorded for reference rather than selected.
+    ['ai_model_type', modelStatus?.xgboost?.engine ?? 'XGBoost'],
+    ['ai_forecast_period', aiForecastPeriod], ['ai_confidence', aiConfidence.toString()],
     ['ai_auto_suggestions', autoRecom.toString()]
   ], setAiSaving, setAiSaved)
 
@@ -231,28 +334,102 @@ export default function Settings() {
     ['logistics_provider', logisticsProvider], ['logistics_auto_shipping', autoShipping.toString()]
   ], setLogisticsSaving, setLogisticsSaved)
 
-  const saveNotifications = () => upsertSettings([
-    ['notif_low_stock', notifLowStock.toString()], ['notif_payments', notifPayments.toString()],
-    ['notif_logistics', notifLogistics.toString()], ['notif_ai', notifAI.toString()],
-    ['notif_email', notifEmail.toString()], ['notif_sms', notifSMS.toString()]
-  ], setNotifSaving, setNotifSaved)
+  const saveNotifications = () => upsertSettings(
+    NOTIFICATION_CATEGORIES.map(c => [`notif_${c.key}`, String(notifCats[c.key] !== false)] as [string, string]),
+    setNotifSaving, setNotifSaved,
+  )
 
-  const saveSalarySettings = () => upsertSettings([
-    ['auto_pay_enabled', autoPayEnabled.toString()], ['auto_pay_day', autoPayDay.toString()]
-  ], setSalarySettingsLoading, setSalarySettingsSaved)
+  // How many of each category have arrived, so the panel shows the switches
+  // are connected to something real rather than asserting it.
+  async function loadNotifCounts() {
+    const { data } = await supabase.from('notifications').select('category')
+    const tally: Record<string, number> = {}
+    for (const r of (data as any[]) || []) tally[r.category] = (tally[r.category] || 0) + 1
+    setNotifCounts(tally)
+  }
+
+  // Writes both gates so turning this off genuinely stops the scheduled run,
+  // rather than leaving the master agent switch on somewhere else.
+  const saveSalarySettings = async () => {
+    await upsertSettings([
+      ['auto_pay_enabled',      autoPayEnabled.toString()],
+      ['agent_payroll_enabled', autoPayEnabled.toString()],
+      ['auto_pay_day',          autoPayDay.toString()],
+    ], setSalarySettingsLoading, setSalarySettingsSaved)
+    await loadPayrollPreview()
+  }
+
+  // Manual payroll run. Forced, so it ignores the enabled/payday checks —
+  // hence the confirm showing exactly who gets paid and how much.
+  const runPayrollNow = async () => {
+    setPayrollRunning(true)
+    setPayrollRunResult(null)
+    const { data, error } = await supabase.rpc('run_payroll_autopay', { p_trigger: 'manual', p_force: true })
+    if (error) {
+      setPayrollRunResult(`Failed: ${error.message}`)
+    } else {
+      const done = Number((data as any)?.done ?? 0)
+      const amt  = Number((data as any)?.total_amount ?? 0)
+      setPayrollRunResult(
+        done > 0
+          ? `Paid ${done.toLocaleString()} salar${done === 1 ? 'y' : 'ies'} — ${locale.money(amt)}.`
+          : 'Nothing to pay — every active employee is already settled this month.'
+      )
+    }
+    setPayrollRunning(false)
+    setPayrollRunConfirm(false)
+    await loadPayrollPreview()
+    fetchAgentRuns()
+  }
+
+  // The single visible toggle writes both switches, so turning it off here
+  // genuinely stops the scheduled run rather than leaving one gate open.
+  const saveVendorPaySettings = async () => {
+    await upsertSettings([
+      ['auto_vendor_pay_enabled',  vendorPayEnabled.toString()],
+      ['agent_vendor_pay_enabled', vendorPayEnabled.toString()],
+      ['auto_vendor_pay_day',      vendorPayDay.toString()],
+    ], setVendorSettingsLoading, setVendorSettingsSaved)
+    await loadVendorPreview()
+  }
+
+  // Manual settlement. Forced, so it ignores the enabled/payday checks — which
+  // is exactly why it sits behind a confirm showing the amount.
+  const runVendorPayNow = async () => {
+    setVendorRunning(true)
+    setVendorRunResult(null)
+    const { data, error } = await supabase.rpc('run_vendor_autopay', { p_trigger: 'manual', p_force: true })
+    if (error) {
+      setVendorRunResult(`Failed: ${error.message}`)
+    } else {
+      const done = Number((data as any)?.done ?? 0)
+      const amt  = Number((data as any)?.total_amount ?? 0)
+      setVendorRunResult(
+        done > 0
+          ? `Settled ${done.toLocaleString()} bill${done === 1 ? '' : 's'} — ${locale.money(amt)} paid out.`
+          : 'Nothing to settle — no outstanding vendor bills.'
+      )
+    }
+    setVendorRunning(false)
+    setVendorRunConfirm(false)
+    await loadVendorPreview()
+    fetchAgentRuns()
+  }
 
   const saveAllSettings = async () => {
     setGlobalSaving(true)
+    // profile_name / profile_email / profile_company are deliberately absent.
+    // They are owned by the sidebar profile card now, and this bulk save would
+    // have written them back from state this page no longer edits — renaming
+    // the company here, then pressing Save All on any other tab, would have
+    // silently restored the old name.
     await supabase.from('app_settings').upsert([
-      { setting_key: 'profile_name',           setting_value: profileName,             updated_at: new Date().toISOString() },
-      { setting_key: 'profile_email',           setting_value: profileEmail,            updated_at: new Date().toISOString() },
-      { setting_key: 'profile_company',         setting_value: profileCompany,          updated_at: new Date().toISOString() },
       { setting_key: 'system_currency',         setting_value: systemCurrency,          updated_at: new Date().toISOString() },
       { setting_key: 'system_timezone',         setting_value: systemTimezone,          updated_at: new Date().toISOString() },
       { setting_key: 'system_business',         setting_value: systemBusiness,          updated_at: new Date().toISOString() },
       { setting_key: 'ai_enabled',              setting_value: aiEnabled.toString(),    updated_at: new Date().toISOString() },
-      { setting_key: 'ai_model_type',           setting_value: aiModelType,             updated_at: new Date().toISOString() },
-      { setting_key: 'ai_interval',             setting_value: aiInterval,              updated_at: new Date().toISOString() },
+      { setting_key: 'ai_model_type',           setting_value: modelStatus?.xgboost?.engine ?? 'XGBoost', updated_at: new Date().toISOString() },
+      { setting_key: 'ai_forecast_period',      setting_value: aiForecastPeriod,        updated_at: new Date().toISOString() },
       { setting_key: 'ai_confidence',           setting_value: aiConfidence.toString(), updated_at: new Date().toISOString() },
       { setting_key: 'ai_auto_suggestions',     setting_value: autoRecom.toString(),    updated_at: new Date().toISOString() },
       { setting_key: 'payment_stripe',          setting_value: paymentStripe.toString(),  updated_at: new Date().toISOString() },
@@ -260,14 +437,21 @@ export default function Settings() {
       { setting_key: 'payment_paypal',          setting_value: paymentPaypal.toString(),  updated_at: new Date().toISOString() },
       { setting_key: 'logistics_provider',      setting_value: logisticsProvider,         updated_at: new Date().toISOString() },
       { setting_key: 'logistics_auto_shipping', setting_value: autoShipping.toString(),   updated_at: new Date().toISOString() },
-      { setting_key: 'notif_low_stock',         setting_value: notifLowStock.toString(),  updated_at: new Date().toISOString() },
-      { setting_key: 'notif_payments',          setting_value: notifPayments.toString(),  updated_at: new Date().toISOString() },
-      { setting_key: 'notif_logistics',         setting_value: notifLogistics.toString(), updated_at: new Date().toISOString() },
-      { setting_key: 'notif_ai',                setting_value: notifAI.toString(),         updated_at: new Date().toISOString() },
-      { setting_key: 'notif_email',             setting_value: notifEmail.toString(),      updated_at: new Date().toISOString() },
-      { setting_key: 'notif_sms',               setting_value: notifSMS.toString(),        updated_at: new Date().toISOString() },
-      { setting_key: 'auto_pay_enabled',        setting_value: autoPayEnabled.toString(),  updated_at: new Date().toISOString() },
-      { setting_key: 'auto_pay_day',            setting_value: autoPayDay.toString(),      updated_at: new Date().toISOString() },
+      ...NOTIFICATION_CATEGORIES.map(c => ({
+        setting_key: `notif_${c.key}`,
+        setting_value: String(notifCats[c.key] !== false),
+        updated_at: new Date().toISOString(),
+      })),
+      // Both gates for each schedule, same as the per-tab saves. Writing only
+      // auto_pay_enabled here would leave the agent switch behind and undo
+      // whatever the Autonomous Agents card had just set.
+      { setting_key: 'auto_pay_enabled',          setting_value: autoPayEnabled.toString(),   updated_at: new Date().toISOString() },
+      { setting_key: 'agent_payroll_enabled',     setting_value: autoPayEnabled.toString(),   updated_at: new Date().toISOString() },
+      { setting_key: 'auto_pay_day',              setting_value: autoPayDay.toString(),       updated_at: new Date().toISOString() },
+      { setting_key: 'auto_vendor_pay_enabled',   setting_value: vendorPayEnabled.toString(), updated_at: new Date().toISOString() },
+      { setting_key: 'agent_vendor_pay_enabled',  setting_value: vendorPayEnabled.toString(), updated_at: new Date().toISOString() },
+      { setting_key: 'auto_vendor_pay_day',       setting_value: vendorPayDay.toString(),     updated_at: new Date().toISOString() },
+      { setting_key: 'agent_restock_enabled',     setting_value: restockAgentEnabled.toString(), updated_at: new Date().toISOString() },
     ], { onConflict: 'setting_key' })
     setGlobalSaving(false)
     setGlobalSaved(true)
@@ -373,36 +557,6 @@ export default function Settings() {
         {/* Main Content Pane */}
         <div className="glass-card" style={{ flex: 1, minHeight: 450, padding: 32 }}>
 
-          {/* ── PROFILE ── */}
-          {activeTab === 'profile' && (
-            <div className="animation-fade-in">
-              <h2 style={{ fontSize: 18, marginBottom: 20 }}>Profile Settings</h2>
-              <div style={{ display: 'flex', gap: 32 }}>
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
-                  <div style={{ width: 90, height: 90, borderRadius: '50%', background: 'linear-gradient(135deg, #6C63FF, #00D4FF)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 28, fontWeight: 700 }}>H</div>
-                  <button className="btn btn-ghost btn-sm" style={{ fontSize: 12 }}><UploadCloud size={14} /> Upload Image</button>
-                </div>
-                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 16 }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-                    <div>
-                      <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Full Name</label>
-                      <input className="glass-input" value={profileName} onChange={e => setProfileName(e.target.value)} style={{ width: '100%' }} />
-                    </div>
-                    <div>
-                      <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Email</label>
-                      <input className="glass-input" value={profileEmail} onChange={e => setProfileEmail(e.target.value)} style={{ width: '100%' }} />
-                    </div>
-                    <div style={{ gridColumn: '1 / -1' }}>
-                      <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Company Name</label>
-                      <input className="glass-input" value={profileCompany} onChange={e => setProfileCompany(e.target.value)} style={{ width: '100%' }} />
-                    </div>
-                  </div>
-                  <SaveBar saving={profileSaving} saved={profileSaved} onSave={saveProfile} label="Save Profile" />
-                </div>
-              </div>
-            </div>
-          )}
-
           {/* ── SYSTEM ── */}
           {activeTab === 'system' && (
             <div className="animation-fade-in">
@@ -411,18 +565,38 @@ export default function Settings() {
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
                   <div>
                     <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Currency</label>
-                    <GlassSelect style={{ width: '100%' }} value={systemCurrency} onChange={setSystemCurrency} options={[
-                      { value: 'USD', label: 'USD ($)' }, { value: 'MYR', label: 'MYR (RM)' },
-                      { value: 'EUR', label: 'EUR (€)' }, { value: 'GBP', label: 'GBP (£)' }
-                    ]} />
+                    {/* Applies on selection, not on Save — every amount in the
+                        app re-renders the moment this changes. */}
+                    <GlassSelect
+                      style={{ width: '100%' }}
+                      value={locale.currency}
+                      onChange={code => { setSystemCurrency(code); locale.setCurrency(code) }}
+                      options={CURRENCIES.map(c => ({
+                        value: c.code,
+                        label: `${c.code} (${new Intl.NumberFormat(c.locale, { style: 'currency', currency: c.code })
+                          .formatToParts(1).find(p => p.type === 'currency')?.value ?? c.code}) — ${c.label}`,
+                      }))}
+                    />
                   </div>
                   <div>
                     <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Time Zone</label>
-                    <GlassSelect style={{ width: '100%' }} value={systemTimezone} onChange={setSystemTimezone} options={[
-                      { value: 'US', label: 'Eastern Time (US)' },
-                      { value: 'MY', label: 'Malaysia Time (MYT)' },
-                      { value: 'UK', label: 'Greenwich Mean Time (GMT)' }
-                    ]} />
+                    <GlassSelect
+                      style={{ width: '100%' }}
+                      value={locale.timezone}
+                      onChange={tz => { setSystemTimezone(tz); locale.setTimezone(tz) }}
+                      options={TIMEZONES.map(t => ({ value: t.id, label: t.label }))}
+                    />
+                  </div>
+                  <div style={{ gridColumn: '1 / -1' }}>
+                    {/* Picking a currency moves the clock to that market's
+                        zone, which is nearly always what is wanted; the
+                        dropdown above still overrides it independently. */}
+                    <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', margin: '0 0 16px' }}>
+                      Sample: <strong style={{ color: '#22d3a8' }}>{locale.money(1234567.89)}</strong>
+                      {'  ·  '}
+                      <strong style={{ color: '#00D4FF' }}>{locale.fmtDateTime(new Date())}</strong>
+                      {'  ·  '}amounts are relabelled, not converted at an FX rate.
+                    </p>
                   </div>
                   <div style={{ gridColumn: '1 / -1' }}>
                     <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Business Type</label>
@@ -438,45 +612,215 @@ export default function Settings() {
           )}
 
           {/* ── SALARY / AUTO-PAY ── */}
-          {activeTab === 'salary' && (
-            <div className="animation-fade-in">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
-                <DollarSign color="#22d3a8" />
-                <h2 style={{ fontSize: 18 }}>Salary & Auto-Pay Settings</h2>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 600 }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px', background: 'rgba(34,211,168,0.05)', borderRadius: 'var(--r-md)', border: '1px solid rgba(34,211,168,0.15)' }}>
-                  <div>
-                    <h3 style={{ fontSize: 14, fontWeight: 600, color: '#22d3a8', marginBottom: 4 }}>Automatic Salary Payment</h3>
-                    <p style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>Automatically mark all employee salaries as paid on a specific day each month.</p>
+          {activeTab === 'salary' && (() => {
+            const ord = (d: number) => `${d}${d === 1 ? 'st' : d === 2 ? 'nd' : d === 3 ? 'rd' : 'th'}`
+            const dueCount  = Number(payrollPreview?.due_count ?? 0)
+            const dueAmount = Number(payrollPreview?.due_amount ?? 0)
+            const money = locale.moneyShort
+            return (
+              <div className="animation-fade-in">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
+                  <DollarSign color="#22d3a8" />
+                  <h2 style={{ fontSize: 18 }}>Salary & Auto-Pay Settings</h2>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 600 }}>
+
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px', background: 'rgba(34,211,168,0.05)', borderRadius: 'var(--r-md)', border: '1px solid rgba(34,211,168,0.15)' }}>
+                    <div>
+                      <h3 style={{ fontSize: 14, fontWeight: 600, color: '#22d3a8', marginBottom: 4 }}>Automatic Salary Payment</h3>
+                      <p style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>Automatically pay every active employee's salary on a specific day each month.</p>
+                    </div>
+                    <Toggle checked={autoPayEnabled} onChange={() => setAutoPayEnabled(!autoPayEnabled)} />
                   </div>
-                  <Toggle checked={autoPayEnabled} onChange={() => setAutoPayEnabled(!autoPayEnabled)} />
-                </div>
-                <div style={{ opacity: autoPayEnabled ? 1 : 0.4, pointerEvents: autoPayEnabled ? 'auto' : 'none', transition: 'opacity 0.3s' }}>
-                  <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Payment Day of Month</label>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <Calendar size={16} color="var(--clr-text-muted)" />
-                    <select className="glass-input" style={{ width: 140 }} value={autoPayDay} onChange={e => setAutoPayDay(parseInt(e.target.value))}>
-                      {Array.from({ length: 28 }, (_, i) => i + 1).map(day => (
-                        <option key={day} value={day}>{day}{day === 1 ? 'st' : day === 2 ? 'nd' : day === 3 ? 'rd' : 'th'} of every month</option>
-                      ))}
-                    </select>
+
+                  <div style={{ opacity: autoPayEnabled ? 1 : 0.4, pointerEvents: autoPayEnabled ? 'auto' : 'none', transition: 'opacity 0.3s' }}>
+                    <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Payment Day of Month</label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <Calendar size={16} color="var(--clr-text-muted)" />
+                      <select className="glass-input" style={{ width: 140 }} value={autoPayDay} onChange={e => setAutoPayDay(parseInt(e.target.value))}>
+                        {Array.from({ length: 28 }, (_, i) => i + 1).map(day => (
+                          <option key={day} value={day}>{ord(day)} of every month</option>
+                        ))}
+                      </select>
+                    </div>
+                    <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 8 }}>
+                      All due salaries will be paid on the {ord(autoPayDay)} of each month.
+                    </p>
                   </div>
-                  <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 8 }}>
-                    All due salaries will be automatically marked as paid on the {autoPayDay}{autoPayDay === 1 ? 'st' : autoPayDay === 2 ? 'nd' : autoPayDay === 3 ? 'rd' : 'th'} of each month.
-                  </p>
+
+                  {/* Live figures, read from the database — same shape as the
+                      vendor page so both switches are read the same way. */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10 }}>
+                    {[
+                      { label: 'Salaries due', value: dueCount.toLocaleString(), color: dueCount > 0 ? '#f59e0b' : '#22d3a8',
+                        sub: `${Number(payrollPreview?.active_staff ?? 0)} active staff` },
+                      { label: 'Amount due',   value: money(dueAmount), color: dueAmount > 0 ? '#f43f5e' : '#22d3a8',
+                        sub: `${money(Number(payrollPreview?.paid_amount ?? 0))} paid` },
+                      { label: 'Next run',     value: payrollPreview?.next_run
+                          ? fmtDate(payrollPreview.next_run, { month: 'short', day: 'numeric' })
+                          : '—',
+                        color: autoPayEnabled ? '#00D4FF' : 'rgba(255,255,255,0.35)',
+                        sub: autoPayEnabled ? 'scheduled' : 'auto-pay off' },
+                    ].map(s => (
+                      <div key={s.label} style={{ padding: '12px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                        <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginBottom: 4 }}>{s.label}</div>
+                        <div style={{ fontSize: 19, fontWeight: 800, color: s.color }}>{s.value}</div>
+                        {s.sub && <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 2 }}>{s.sub}</div>}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ background: 'rgba(0,212,255,0.05)', border: '1px solid rgba(0,212,255,0.15)', borderRadius: 'var(--r-md)', padding: 14 }}>
+                    <p style={{ fontSize: 12, color: 'rgba(0,212,255,0.8)', lineHeight: 1.6 }}>
+                      💡 When auto-pay is enabled, salary records for every active employee are created and marked as "Paid" on the selected day. Inactive and On Leave staff are never paid and never have a record raised. You can still pay individuals from the Employees page at any time, and turning this off stops the scheduled run immediately.
+                    </p>
+                  </div>
+
+                  {/* Manual run. Bypasses the schedule, so it states the amount
+                      first and needs a second click. */}
+                  <div style={{ background: 'rgba(244,63,94,0.04)', border: '1px solid rgba(244,63,94,0.15)', borderRadius: 'var(--r-md)', padding: 14 }}>
+                    <h4 style={{ fontSize: 13, fontWeight: 600, color: '#f43f5e', marginBottom: 6 }}>Pay all due salaries now</h4>
+                    <p style={{ fontSize: 11.5, color: 'var(--clr-text-muted)', lineHeight: 1.6, marginBottom: 12 }}>
+                      Runs immediately, regardless of the schedule or the toggle above. This marks every active employee's due salary as paid and cannot be undone from this page.
+                    </p>
+                    {!payrollRunConfirm ? (
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        disabled={dueCount === 0}
+                        onClick={() => { setPayrollRunResult(null); setPayrollRunConfirm(true) }}
+                        style={{ fontSize: 12, color: dueCount === 0 ? 'rgba(255,255,255,0.3)' : '#f43f5e', borderColor: 'rgba(244,63,94,0.3)' }}
+                      >
+                        <DollarSign size={13} /> {dueCount === 0 ? 'Nothing due' : `Pay ${dueCount.toLocaleString()} salaries · ${money(dueAmount)}`}
+                      </button>
+                    ) : (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 12, color: '#f43f5e', fontWeight: 600 }}>
+                          Pay {money(dueAmount)} to {dueCount.toLocaleString()} employee{dueCount === 1 ? '' : 's'}?
+                        </span>
+                        <button className="btn btn-danger btn-sm" onClick={runPayrollNow} disabled={payrollRunning} style={{ fontSize: 12 }}>
+                          {payrollRunning ? 'Paying…' : 'Yes, pay now'}
+                        </button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setPayrollRunConfirm(false)} disabled={payrollRunning} style={{ fontSize: 12 }}>Cancel</button>
+                      </div>
+                    )}
+                    {payrollRunResult && (
+                      <p style={{ fontSize: 12, color: payrollRunResult.startsWith('Failed') ? '#f43f5e' : '#22d3a8', marginTop: 10 }}>
+                        {payrollRunResult}
+                      </p>
+                    )}
+                  </div>
+
+                  <button className="btn btn-primary" onClick={saveSalarySettings} disabled={salarySettingsLoading} style={{ alignSelf: 'flex-start' }}>
+                    <Save size={16} /> {salarySettingsSaved ? '✓ Saved!' : 'Save Salary Settings'}
+                  </button>
                 </div>
-                <div style={{ background: 'rgba(0,212,255,0.05)', border: '1px solid rgba(0,212,255,0.15)', borderRadius: 'var(--r-md)', padding: 14 }}>
-                  <p style={{ fontSize: 12, color: 'rgba(0,212,255,0.8)', lineHeight: 1.6 }}>
-                    💡 When auto-pay is enabled, salary records for all active employees will be created and marked as "Paid" on the selected day. You can still manually pay individual employees from the Employees page anytime.
-                  </p>
-                </div>
-                <button className="btn btn-primary" onClick={saveSalarySettings} style={{ alignSelf: 'flex-start' }}>
-                  <Save size={16} /> {salarySettingsSaved ? '✓ Saved!' : 'Save Salary Settings'}
-                </button>
               </div>
-            </div>
-          )}
+            )
+          })()}
+
+          {/* ── VENDOR AUTO-PAY ── */}
+          {activeTab === 'vendorpay' && (() => {
+            const ord = (d: number) => `${d}${d === 1 ? 'st' : d === 2 ? 'nd' : d === 3 ? 'rd' : 'th'}`
+            const dueOrders = Number(vendorPreview?.due_orders ?? 0)
+            const dueAmount = Number(vendorPreview?.due_amount ?? 0)
+            const money = locale.moneyShort
+            return (
+              <div className="animation-fade-in">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
+                  <Building2 color="#f59e0b" />
+                  <h2 style={{ fontSize: 18 }}>Vendor Payment & Auto-Pay Settings</h2>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 600 }}>
+
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px', background: 'rgba(245,158,11,0.05)', borderRadius: 'var(--r-md)', border: '1px solid rgba(245,158,11,0.15)' }}>
+                    <div>
+                      <h3 style={{ fontSize: 14, fontWeight: 600, color: '#f59e0b', marginBottom: 4 }}>Automatic Vendor Payment</h3>
+                      <p style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>Automatically settle every outstanding vendor bill on a specific day each month.</p>
+                    </div>
+                    <Toggle checked={vendorPayEnabled} onChange={() => setVendorPayEnabled(!vendorPayEnabled)} />
+                  </div>
+
+                  <div style={{ opacity: vendorPayEnabled ? 1 : 0.4, pointerEvents: vendorPayEnabled ? 'auto' : 'none', transition: 'opacity 0.3s' }}>
+                    <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Payment Day of Month</label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <Calendar size={16} color="var(--clr-text-muted)" />
+                      <select className="glass-input" style={{ width: 140 }} value={vendorPayDay} onChange={e => setVendorPayDay(parseInt(e.target.value))}>
+                        {Array.from({ length: 28 }, (_, i) => i + 1).map(day => (
+                          <option key={day} value={day}>{ord(day)} of every month</option>
+                        ))}
+                      </select>
+                    </div>
+                    <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 8 }}>
+                      All unpaid vendor bills will be settled on the {ord(vendorPayDay)} of each month.
+                    </p>
+                  </div>
+
+                  {/* What a run would actually do, read live from the database. */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10 }}>
+                    {[
+                      { label: 'Outstanding bills', value: dueOrders.toLocaleString(), color: dueOrders > 0 ? '#f59e0b' : '#22d3a8' },
+                      { label: 'Amount due',        value: money(dueAmount),           color: dueAmount > 0 ? '#f43f5e' : '#22d3a8' },
+                      { label: 'Next run',          value: vendorPreview?.next_run
+                          ? fmtDate(vendorPreview.next_run, { month: 'short', day: 'numeric' })
+                          : '—',
+                        color: vendorPayEnabled ? '#00D4FF' : 'rgba(255,255,255,0.35)',
+                        sub: vendorPayEnabled ? 'scheduled' : 'auto-pay off' },
+                    ].map(s => (
+                      <div key={s.label} style={{ padding: '12px 14px', borderRadius: 10, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                        <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginBottom: 4 }}>{s.label}</div>
+                        <div style={{ fontSize: 19, fontWeight: 800, color: s.color }}>{s.value}</div>
+                        {s.sub && <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 2 }}>{s.sub}</div>}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ background: 'rgba(0,212,255,0.05)', border: '1px solid rgba(0,212,255,0.15)', borderRadius: 'var(--r-md)', padding: 14 }}>
+                    <p style={{ fontSize: 12, color: 'rgba(0,212,255,0.8)', lineHeight: 1.6 }}>
+                      💡 When vendor auto-pay is enabled, every purchase order still marked unpaid is stamped as settled on the selected day, and each payment appears under Payment → Vendor Payments. You can still settle individual bills manually there at any time. Turning this off stops the scheduled run immediately.
+                    </p>
+                  </div>
+
+                  {/* Manual run. Bypasses the schedule, so it states the damage
+                      first and needs a second click. */}
+                  <div style={{ background: 'rgba(244,63,94,0.04)', border: '1px solid rgba(244,63,94,0.15)', borderRadius: 'var(--r-md)', padding: 14 }}>
+                    <h4 style={{ fontSize: 13, fontWeight: 600, color: '#f43f5e', marginBottom: 6 }}>Settle all bills now</h4>
+                    <p style={{ fontSize: 11.5, color: 'var(--clr-text-muted)', lineHeight: 1.6, marginBottom: 12 }}>
+                      Runs immediately, regardless of the schedule or the toggle above. This marks every outstanding bill as paid and cannot be undone from this page.
+                    </p>
+                    {!vendorRunConfirm ? (
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        disabled={dueOrders === 0}
+                        onClick={() => { setVendorRunResult(null); setVendorRunConfirm(true) }}
+                        style={{ fontSize: 12, color: dueOrders === 0 ? 'rgba(255,255,255,0.3)' : '#f43f5e', borderColor: 'rgba(244,63,94,0.3)' }}
+                      >
+                        <DollarSign size={13} /> {dueOrders === 0 ? 'Nothing outstanding' : `Settle ${dueOrders.toLocaleString()} bills · ${money(dueAmount)}`}
+                      </button>
+                    ) : (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 12, color: '#f43f5e', fontWeight: 600 }}>
+                          Pay {money(dueAmount)} across {dueOrders.toLocaleString()} bills?
+                        </span>
+                        <button className="btn btn-danger btn-sm" onClick={runVendorPayNow} disabled={vendorRunning} style={{ fontSize: 12 }}>
+                          {vendorRunning ? 'Settling…' : 'Yes, settle now'}
+                        </button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setVendorRunConfirm(false)} disabled={vendorRunning} style={{ fontSize: 12 }}>Cancel</button>
+                      </div>
+                    )}
+                    {vendorRunResult && (
+                      <p style={{ fontSize: 12, color: vendorRunResult.startsWith('Failed') ? '#f43f5e' : '#22d3a8', marginTop: 10 }}>
+                        {vendorRunResult}
+                      </p>
+                    )}
+                  </div>
+
+                  <button className="btn btn-primary" onClick={saveVendorPaySettings} disabled={vendorSettingsLoading} style={{ alignSelf: 'flex-start' }}>
+                    <Save size={16} /> {vendorSettingsSaved ? '✓ Saved!' : 'Save Vendor Payment Settings'}
+                  </button>
+                </div>
+              </div>
+            )
+          })()}
 
           {/* ── INVENTORY ── */}
           {activeTab === 'inventory' && (
@@ -594,23 +938,79 @@ export default function Settings() {
                   <div><h3 style={{ fontSize: 14, fontWeight: 600, color: '#00D4FF', marginBottom: 4 }}>Enable AI Predictions</h3><p style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>Use machine learning to forecast demand continuously.</p></div>
                   <Toggle checked={aiEnabled} onChange={() => setAiEnabled(!aiEnabled)} />
                 </div>
+                {/* ── Engine status ──
+                    Not a dropdown: the engine is whatever binary loaded on the
+                    backend, and both loaders fall back to a statistical policy
+                    when a file is missing. Offering ARIMA/LSTM as choices was
+                    fiction — none of them exist in the pipeline. */}
+                <div style={{ opacity: aiEnabled ? 1 : 0.5, transition: 'opacity 0.3s' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <label style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>Live Model Pipeline</label>
+                    <button className="btn btn-ghost btn-sm" onClick={loadModelStatus} disabled={modelStatusLoading} style={{ fontSize: 11 }}>
+                      <RefreshCw size={12} /> {modelStatusLoading ? 'Checking…' : 'Re-check'}
+                    </button>
+                  </div>
+
+                  {modelStatusErr && (
+                    <div style={{ padding: 12, borderRadius: 10, background: 'rgba(244,63,94,0.07)', border: '1px solid rgba(244,63,94,0.25)', marginBottom: 10 }}>
+                      <p style={{ margin: 0, fontSize: 12, color: '#f43f5e' }}>
+                        Backend unreachable ({modelStatusErr}). Forecasts will fall back to the statistical policy until it responds.
+                      </p>
+                    </div>
+                  )}
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    {[
+                      { key: 'xgboost', name: 'XGBoost', role: 'Demand forecasting — predicts units sold per product family',
+                        loaded: modelStatus?.xgboost?.loaded, engine: modelStatus?.xgboost?.engine, primary: true },
+                      { key: 'ppo', name: 'PPO (Stable-Baselines3)', role: 'Reorder optimisation — chooses the order quantity',
+                        loaded: modelStatus?.ppo?.loaded, engine: modelStatus?.ppo?.engine, primary: false },
+                      { key: 'llm', name: 'GPT-4o-mini', role: 'Market sentiment from oil price, holidays and news',
+                        loaded: modelStatus ? true : undefined, engine: 'OpenRouter', primary: false },
+                    ].map(m => {
+                      const on = m.loaded === true
+                      const c = on ? '#22d3a8' : m.loaded === false ? '#f59e0b' : 'rgba(255,255,255,0.3)'
+                      return (
+                        <div key={m.key} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderRadius: 10, background: m.primary ? 'rgba(0,212,255,0.05)' : 'rgba(255,255,255,0.03)', border: `1px solid ${m.primary ? 'rgba(0,212,255,0.18)' : 'rgba(255,255,255,0.07)'}` }}>
+                          <span style={{ width: 8, height: 8, borderRadius: '50%', background: c, boxShadow: on ? `0 0 8px ${c}` : 'none', flexShrink: 0 }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: on ? '#fff' : 'rgba(255,255,255,0.6)' }}>
+                              {m.name}
+                              {m.primary && <span style={{ fontSize: 9, marginLeft: 8, padding: '2px 6px', borderRadius: 5, background: 'rgba(0,212,255,0.15)', color: '#00D4FF', fontWeight: 700 }}>FORECAST ENGINE</span>}
+                            </div>
+                            <div style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 2 }}>{m.role}</div>
+                          </div>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: c, flexShrink: 0, textAlign: 'right' }}>
+                            {m.loaded === undefined ? 'UNKNOWN' : on ? 'LOADED' : 'FALLBACK'}
+                            {m.engine && m.loaded === false && (
+                              <div style={{ fontSize: 9, fontWeight: 500, color: 'var(--clr-text-muted)', marginTop: 2 }}>{m.engine}</div>
+                            )}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, opacity: aiEnabled ? 1 : 0.5, pointerEvents: aiEnabled ? 'auto' : 'none' }}>
                   <div>
-                    <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Model Type</label>
-                    <GlassSelect style={{ width: '100%' }} value={aiModelType} onChange={setAiModelType} options={[
-                      { value: 'Regression', label: 'Linear Regression' }, { value: 'ARIMA', label: 'Time Series (ARIMA)' }, { value: 'LSTM', label: 'Neural Net (LSTM)' }
-                    ]} />
-                  </div>
-                  <div>
-                    <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Prediction Interval</label>
-                    <GlassSelect style={{ width: '100%' }} value={aiInterval} onChange={setAiInterval} options={[
-                      { value: 'Daily', label: 'Daily' }, { value: 'Weekly', label: 'Weekly' }, { value: 'Monthly', label: 'Monthly' }
-                    ]} />
+                    <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Default Forecast Horizon</label>
+                    <GlassSelect
+                      style={{ width: '100%' }}
+                      value={aiForecastPeriod}
+                      onChange={setAiForecastPeriod}
+                      options={FORECAST_PERIODS.map(p => ({ value: p.value, label: p.label }))}
+                    />
+                    <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 6 }}>
+                      How far ahead XGBoost projects. Used as the default on the Sales Forecast page and sent to the model as <code style={{ fontSize: 10 }}>forecast_period</code>.
+                    </p>
                   </div>
                   <div>
                     <label style={{ display: 'block', fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 6 }}>Confidence Threshold (%)</label>
                     <input type="number" className="glass-input" value={aiConfidence} min={50} max={99} onChange={e => setAiConfidence(Math.min(99, Math.max(50, parseInt(e.target.value) || 85)))} style={{ width: '100%' }} />
-                    <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 6 }}>Alerts trigger only if AI confidence exceeds this.</p>
+                    <p style={{ fontSize: 11, color: 'var(--clr-text-muted)', marginTop: 6 }}>
+                      A forecast below this confidence is shown but not turned into an automatic restock suggestion.
+                    </p>
                   </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px', marginTop: 10, background: 'rgba(255,255,255,0.03)', borderRadius: 'var(--r-md)', border: '1px solid rgba(255,255,255,0.05)', opacity: aiEnabled ? 1 : 0.5, pointerEvents: aiEnabled ? 'auto' : 'none' }}>
@@ -627,14 +1027,16 @@ export default function Settings() {
                     <h2 style={{ fontSize: 16, margin: 0 }}>Autonomous Agents</h2>
                   </div>
                   <p style={{ fontSize: 12, color: 'var(--clr-text-muted)', marginBottom: 16, marginTop: 0 }}>
-                    These run server-side with no approval step. While off, the agent never touches your data — restock orders and payroll only happen when you click the buttons yourself.
+                    These run server-side with no approval step. While off, the agent never touches your data — restock orders, payroll and vendor payments only happen when you click the buttons yourself.
                   </p>
 
                   {[
-                    { kind: 'restock' as const, label: 'Restock Agent', enabled: restockAgentEnabled,
+                    { kind: 'restock' as const, label: 'Restock Agent', enabled: restockAgentEnabled, tab: null,
                       desc: 'Watches stock levels and places vendor orders the instant a product drops below reorder level, plus a daily safety sweep.' },
-                    { kind: 'payroll' as const, label: 'Payroll Agent', enabled: payrollAgentEnabled,
-                      desc: 'Pays every employee with a due salary automatically — checked daily, acts when payday data is due.' },
+                    { kind: 'payroll' as const, label: 'Payroll Agent', enabled: autoPayEnabled, tab: 'salary',
+                      desc: `Pays every active employee with a due salary on the ${autoPayDay}${autoPayDay === 1 ? 'st' : autoPayDay === 2 ? 'nd' : autoPayDay === 3 ? 'rd' : 'th'} of each month. Checked daily, acts only on payday.` },
+                    { kind: 'vendorpay' as const, label: 'Vendor Payment Agent', enabled: vendorPayEnabled, tab: 'vendorpay',
+                      desc: `Settles every outstanding vendor bill on the ${vendorPayDay}${vendorPayDay === 1 ? 'st' : vendorPayDay === 2 ? 'nd' : vendorPayDay === 3 ? 'rd' : 'th'} of each month. Checked daily, acts only on that day.` },
                   ].map(a => (
                     <div key={a.kind} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '16px', marginBottom: 12, background: a.enabled ? 'rgba(108,99,255,0.07)' : 'rgba(255,255,255,0.03)', borderRadius: 'var(--r-md)', border: `1px solid ${a.enabled ? 'rgba(108,99,255,0.25)' : 'rgba(255,255,255,0.05)'}`, transition: 'background 0.3s ease, border-color 0.3s ease' }}>
                       <div>
@@ -642,6 +1044,16 @@ export default function Settings() {
                           {a.label} {a.enabled && <span style={{ fontSize: 10, color: '#22d3a8', fontWeight: 700, marginLeft: 6 }}>● ACTIVE</span>}
                         </h3>
                         <p style={{ fontSize: 12, color: 'var(--clr-text-muted)', margin: 0 }}>{a.desc}</p>
+                        {/* This toggle and the settings page drive the same
+                            switches, so say where the day and amounts live. */}
+                        {a.tab && (
+                          <button
+                            onClick={() => setActiveTab(a.tab as string)}
+                            style={{ background: 'none', border: 'none', padding: 0, marginTop: 6, cursor: 'pointer', fontSize: 11, fontWeight: 600, color: '#6C63FF' }}
+                          >
+                            Configure schedule →
+                          </button>
+                        )}
                       </div>
                       <button
                         disabled={agentToggleBusy === a.kind}
@@ -664,15 +1076,17 @@ export default function Settings() {
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 200, overflowY: 'auto' }}>
                       {agentRuns.map(r => {
                         const s = r.summary || {}
-                        const color = r.run_type === 'payroll' ? '#a78bfa' : '#f59e0b'
+                        const color = r.run_type === 'payroll' ? '#a78bfa'
+                                    : r.run_type === 'vendor_pay' ? '#22d3a8'
+                                    : '#f59e0b'
                         return (
                           <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 12px', borderRadius: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', fontSize: 11 }}>
                             <span style={{ padding: '2px 7px', borderRadius: 8, background: `${color}1e`, color, fontWeight: 700, fontSize: 10, flexShrink: 0 }}>{r.run_type.toUpperCase()}</span>
                             <span style={{ color: 'rgba(255,255,255,0.4)', flexShrink: 0 }}>{r.trigger_source}</span>
                             <span style={{ flex: 1, color: 'rgba(255,255,255,0.6)' }}>
-                              {s.note || `${s.done || 0} done${s.skipped ? ` · ${s.skipped} skipped` : ''}${s.total_amount ? ` · $${Number(s.total_amount).toLocaleString()}` : ''}`}
+                              {s.note || `${s.done || 0} done${s.skipped ? ` · ${s.skipped} skipped` : ''}${s.total_amount ? ` · ${locale.symbol}${Number(s.total_amount).toLocaleString()}` : ''}`}
                             </span>
-                            <span style={{ color: 'rgba(255,255,255,0.3)', flexShrink: 0 }}>{new Date(r.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+                            <span style={{ color: 'rgba(255,255,255,0.3)', flexShrink: 0 }}>{fmtDateTime(r.created_at)}</span>
                           </div>
                         )
                       })}
@@ -735,20 +1149,60 @@ export default function Settings() {
           {activeTab === 'notifications' && (
             <div className="animation-fade-in">
               <h2 style={{ fontSize: 18, marginBottom: 20 }}>Notification Settings</h2>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 600 }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 12 }}>Internal System Alerts</label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, cursor: 'pointer', marginBottom: 10 }}><input type="checkbox" checked={notifLowStock}  onChange={e => setNotifLowStock(e.target.checked)}  /> Low Stock &amp; Inventory Outages</label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, cursor: 'pointer', marginBottom: 10 }}><input type="checkbox" checked={notifPayments}  onChange={e => setNotifPayments(e.target.checked)}  /> Payment Failures</label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, cursor: 'pointer', marginBottom: 10 }}><input type="checkbox" checked={notifLogistics} onChange={e => setNotifLogistics(e.target.checked)} /> Logistics Delays</label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, cursor: 'pointer' }}><input type="checkbox" checked={notifAI}        onChange={e => setNotifAI(e.target.checked)}        /> AI Behavior Insights</label>
+              <p style={{ fontSize: 12.5, color: 'var(--clr-text-muted)', marginTop: -10, marginBottom: 20, lineHeight: 1.7, maxWidth: 620 }}>
+                These are the four things this system actually produces events for. Each is raised by a database
+                trigger, so it fires whether the change came from you, an agent or the admin console. Turning a
+                category off stops it being recorded at all.
+              </p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 620 }}>
+                {NOTIFICATION_CATEGORIES.map(c => {
+                  const on = notifCats[c.key] !== false
+                  const count = notifCounts[c.key] ?? 0
+                  return (
+                    <div key={c.key} style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: 16,
+                      borderRadius: 'var(--r-md)',
+                      background: on ? `${c.color}0d` : 'rgba(255,255,255,0.025)',
+                      border: `1px solid ${on ? `${c.color}30` : 'rgba(255,255,255,0.06)'}`,
+                      transition: 'background 0.25s, border-color 0.25s',
+                    }}>
+                      <div style={{ minWidth: 0 }}>
+                        <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 4, color: on ? c.color : 'rgba(255,255,255,0.65)' }}>
+                          {c.label}
+                          {count > 0 && (
+                            <span style={{ fontSize: 10, fontWeight: 700, marginLeft: 8, padding: '2px 7px', borderRadius: 6, background: 'rgba(255,255,255,0.07)', color: 'rgba(255,255,255,0.55)' }}>
+                              {count} received
+                            </span>
+                          )}
+                        </h3>
+                        <p style={{ fontSize: 12, color: 'var(--clr-text-muted)', margin: 0 }}>{c.desc}</p>
+                      </div>
+                      <Toggle checked={on} onChange={() => setNotifCats(p => ({ ...p, [c.key]: !on }))} />
+                    </div>
+                  )
+                })}
+
+                <div style={{ background: 'rgba(0,212,255,0.05)', border: '1px solid rgba(0,212,255,0.15)', borderRadius: 'var(--r-md)', padding: 14 }}>
+                  <p style={{ fontSize: 12, color: 'rgba(0,212,255,0.8)', lineHeight: 1.65, margin: 0 }}>
+                    💡 Notifications appear on the bell at the top right of every page. Clicking one marks it read and
+                    opens the page it refers to. Repeats are collapsed, so a product going low twice in one day is a
+                    single entry, and a daily agent run that did nothing stays silent.
+                  </p>
                 </div>
-                <div style={{ height: 1, background: 'rgba(255,255,255,0.1)' }} />
-                <div>
-                  <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 12 }}>External Forwarding</label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, cursor: 'pointer', marginBottom: 10 }}><input type="checkbox" checked={notifEmail} onChange={e => setNotifEmail(e.target.checked)} /> Forward Critical Alerts to Email</label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, cursor: 'pointer' }}><input type="checkbox" checked={notifSMS}   onChange={e => setNotifSMS(e.target.checked)}   /> Push Notifications to SMS</label>
-                </div>
+
+                {/* Two old options are gone on purpose. Saying why is better
+                    than leaving switches that quietly do nothing. */}
+                <details style={{ fontSize: 12, color: 'var(--clr-text-muted)' }}>
+                  <summary style={{ cursor: 'pointer', color: 'rgba(255,255,255,0.45)' }}>Why SMS and email forwarding were removed</summary>
+                  <p style={{ lineHeight: 1.7, marginTop: 8 }}>
+                    No SMS provider is configured anywhere in this project, so that switch could never have sent
+                    anything. Email runs through EmailJS, which is browser-side — it can only send while a tab is
+                    open, which is exactly when an alert is least needed. Both would need a server-side sender to
+                    work honestly. The old “Logistics Delays” and “AI Behavior Insights” options had no event
+                    source behind them either.
+                  </p>
+                </details>
+
                 <SaveBar saving={notifSaving} saved={notifSaved} onSave={saveNotifications} label="Save Notification Settings" />
               </div>
             </div>
