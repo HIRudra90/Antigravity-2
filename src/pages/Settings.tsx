@@ -915,9 +915,13 @@ export default function Settings() {
                       </button>
                     ))}
                     <span style={{ width: 1, height: 26, background: 'rgba(255,255,255,0.12)' }} />
+                    {/* Capped at 60: a signed-in session carries
+                        statement_timeout=8s and a run costs ~0.12s per
+                        simulated day, so longer would abort partway and leave
+                        some days written and others not. */}
                     <input
-                      type="number" min={1} max={90} value={simDays}
-                      onChange={e => setSimDays(Math.max(1, Math.min(90, Number(e.target.value) || 1)))}
+                      type="number" min={1} max={60} value={simDays}
+                      onChange={e => setSimDays(Math.max(1, Math.min(60, Number(e.target.value) || 1)))}
                       className="glass-input" style={{ width: 74, fontSize: 13, padding: '7px 10px' }}
                     />
                     <button className="btn btn-primary" disabled={simRunning}
