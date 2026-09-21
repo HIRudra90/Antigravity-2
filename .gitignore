@@ -26,3 +26,6 @@ supabase/backups/
 
 # Vite writes this beside the config when it reloads it; regenerated per run.
 vite.config.ts.timestamp-*.mjs
+
+# Office lock files, written while a document is open and deleted on close.
+~$*
