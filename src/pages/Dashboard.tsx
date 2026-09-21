@@ -586,7 +586,10 @@ export default function Dashboard() {
       const recent = recentRes.data
 
       if (recent && ov) {
-        const { data: dailyRev } = await supabase.rpc('get_daily_revenue', { days_back: 6 })
+        // The KPI cards above stay epoch-scoped — they are the accounting
+        // figures. This is a 7-day trend line, and drawing it from the epoch
+        // renders a single point until a week has passed since the reset.
+        const { data: dailyRev } = await supabase.rpc('get_daily_revenue', { days_back: 6, p_all_history: true })
         const dateRevMap: Record<string, number> = {}
         if (dailyRev) (dailyRev as any[]).forEach((r: any) => { dateRevMap[r.sale_date] = Number(r.revenue) })
         const DAYS_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']

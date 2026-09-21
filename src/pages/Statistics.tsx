@@ -470,7 +470,19 @@ export default function Statistics() {
   const [stats, setStats] = useState({ totalRevenue: 0, totalProfit: 0, totalUnits: 0, avgOrderValue: 0 })
   const [modalCard, setModalCard] = useState<string | null>(null)
 
-  useEffect(() => { fetchStats() }, [])
+  /**
+   * Which window these figures cover.
+   *
+   * Defaults to all history. This page exists to show trends, and the
+   * accounting epoch leaves it with a single day — 62,338 sales rows across
+   * 264 days were sitting in the table while every chart here drew one point.
+   * The money cards on the Payment page remain epoch-scoped and are still the
+   * accounting truth; this is the analytics view of the same rows, and the
+   * heading says which window is in force.
+   */
+  const [allHistory, setAllHistory] = useState(true)
+
+  useEffect(() => { fetchStats() }, [allHistory])
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') setModalCard(null) }
     window.addEventListener('keydown', handler)
@@ -488,13 +500,22 @@ export default function Statistics() {
         { data: catRev },
         { data: daily },
       ] = await Promise.all([
-        supabase.rpc('get_monthly_revenue', { months_back: 12 }),
-        supabase.rpc('get_top_products',    { months_back: 12 }),
-        supabase.rpc('get_category_revenue',{ months_back: 12 }),
-        supabase.rpc('get_daily_revenue',   { days_back: 7 }),
+        supabase.rpc('get_monthly_revenue', { months_back: 12, p_all_history: allHistory }),
+        supabase.rpc('get_top_products',    { months_back: 12, p_all_history: allHistory }),
+        supabase.rpc('get_category_revenue',{ months_back: 12, p_all_history: allHistory }),
+        supabase.rpc('get_daily_revenue',   { days_back: 7,    p_all_history: allHistory }),
       ])
 
-      if (!monthly?.length) return
+      // Clear rather than bail out. A bare `return` here used to leave the
+      // previous render's numbers on screen, which was harmless while the
+      // window was fixed but is not now: switching to a window with no rows
+      // would show the other window's figures under the new label.
+      if (!monthly?.length) {
+        setRevenueGrowth([]); setProfitTrend([]); setTopSelling([])
+        setCategoryContribution([]); setComparisonActual([]); setDailyRevenue([])
+        setStats({ totalRevenue: 0, totalProfit: 0, totalUnits: 0, avgOrderValue: 0 })
+        return
+      }
 
       const shorten = (mk: string) => mk.replace(' 20', " '")
       const last6 = (monthly as any[]).slice(-6)
@@ -545,9 +566,14 @@ export default function Statistics() {
     }
   }
 
+  // "(YTD)" was true when this page could only ever read the current year.
+  // With the window switchable it would be a lie half the time, so the label
+  // names the window actually in force.
+  const windowLabel = allHistory ? 'All time' : 'Since opening'
+
   const statCards = [
-    { id: 'revenue', label: 'Total Revenue (YTD)', value: fmt(stats.totalRevenue), icon: DollarSign, color: '#6C63FF' },
-    { id: 'profit',  label: 'Net Profit (YTD)',    value: fmt(stats.totalProfit),  icon: TrendingUp, color: '#22d3a8' },
+    { id: 'revenue', label: `Total Revenue (${windowLabel})`, value: fmt(stats.totalRevenue), icon: DollarSign, color: '#6C63FF' },
+    { id: 'profit',  label: `Net Profit (${windowLabel})`,    value: fmt(stats.totalProfit),  icon: TrendingUp, color: '#22d3a8' },
     { id: 'units',   label: 'Units Sold',          value: stats.totalUnits.toLocaleString(), icon: Package, color: '#00D4FF' },
     { id: 'avg',     label: 'Avg Transaction',     value: fmt(stats.avgOrderValue), icon: Activity, color: '#f59e0b' },
   ]
@@ -559,9 +585,33 @@ export default function Statistics() {
       <div className="page-header page-header-row">
         <div>
           <h1>Business Analytics</h1>
-          <p>Live revenue, profit, and product performance from your sales data</p>
+          <p>
+            Live revenue, profit, and product performance from your sales data
+            <span style={{ marginLeft: 8, color: allHistory ? '#00D4FF' : '#f59e0b' }}>
+              · {allHistory ? 'all time' : 'since the books were opened'}
+            </span>
+          </p>
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={() => fetchStats()}><RefreshCw size={14} /> Refresh</button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          {/* Two questions, two windows. "Since books opened" matches the
+              Payment page's money cards; "All time" reads every row, which is
+              what a trend needs. The heading above says which is in force so a
+              figure here is never mistaken for the accounting one. */}
+          <div style={{ display: 'flex', gap: 4, background: 'rgba(255,255,255,0.04)', padding: 4, borderRadius: 10, border: '1px solid var(--clr-border)' }}>
+            {([[true, 'All time'], [false, 'Since books opened']] as const).map(([val, label]) => (
+              <button key={label} onClick={() => setAllHistory(val)}
+                style={{
+                  padding: '6px 12px', borderRadius: 7, fontSize: 12, fontWeight: 600, border: 'none',
+                  cursor: 'pointer', whiteSpace: 'nowrap', transition: 'background 0.18s',
+                  background: allHistory === val ? 'rgba(108,99,255,0.25)' : 'transparent',
+                  color: allHistory === val ? '#a78bfa' : 'var(--clr-text-muted)',
+                }}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={() => fetchStats()}><RefreshCw size={14} /> Refresh</button>
+        </div>
       </div>
 
       <div className="stat-grid">

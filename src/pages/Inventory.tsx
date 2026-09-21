@@ -270,8 +270,10 @@ export default function Inventory() {
           return { name: p.name, speed: avgDailySpeed, stock: Math.round(stockPct), z: p.stock / 2, color }
         }))
 
-        // Stock Over Time: current stock minus monthly sales going backwards
-        const { data: monthlySales } = await supabase.rpc('get_monthly_revenue', { months_back: 6 })
+        // Stock Over Time: current stock minus monthly sales going backwards.
+        // Reads all history — a six-month trend built from the accounting
+        // epoch would be a single month, which is not a trend.
+        const { data: monthlySales } = await supabase.rpc('get_monthly_revenue', { months_back: 6, p_all_history: true })
         if (monthlySales) {
           let running = totalStock
           const trendMonths = [...(monthlySales as any[])].reverse().map((r: any) => {
