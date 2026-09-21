@@ -730,7 +730,7 @@ export default function Restock() {
     try {
     const { data: invData } = await supabase
       .from('inventory')
-      .select('id, product_id, current_stock, reorder_level, products(id, name, family, unit_price, supplier_lead_time_days)')
+      .select('id, product_id, current_stock, on_order, reorder_level, products(id, name, family, unit_price, supplier_lead_time_days)')
       .order('current_stock')
 
     const twoWeeksAgo = new Date(); twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 13)
@@ -742,17 +742,27 @@ export default function Restock() {
       .limit(5000)
 
     if (invData) {
-      const lowStock = invData.filter((i: any) => i.current_stock <= i.reorder_level)
+      // Counts stock already on its way, matching the restock agent's test
+      // exactly (migration 033). Without on_order this queue would keep
+      // listing a product whose replacement is in transit, and approving it
+      // again would order a second shipment of the same thing.
+      const lowStock = invData.filter(
+        (i: any) => i.current_stock + (i.on_order ?? 0) <= i.reorder_level
+      )
       const queue = lowStock.map((item: any) => {
         const p = Array.isArray(item.products) ? item.products[0] : item.products
-        const ratio = item.reorder_level > 0 ? item.current_stock / item.reorder_level : 0
+        const onOrder = item.on_order ?? 0
+        const ratio = item.reorder_level > 0 ? (item.current_stock + onOrder) / item.reorder_level : 0
         const priority = item.current_stock === 0 ? 'Critical' : ratio <= 0.5 ? 'Critical' : ratio <= 0.8 ? 'High' : 'Medium'
         return {
           sku: `SKU-${1000 + (p?.id || 0)}`,
           name: p?.name || 'Unknown',
           current: item.current_stock,
+          onOrder,
           reorder: item.reorder_level,
-          suggest: Math.round(item.reorder_level * 3),
+          // Net of what is already coming, so approving twice in a row does
+          // not order double.
+          suggest: Math.max(0, Math.round(item.reorder_level * 3) - onOrder),
           supplier: p?.family || 'Auto-Assign',
           eta: `${p?.supplier_lead_time_days ?? 3} days`,
           priority,

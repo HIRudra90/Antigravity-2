@@ -72,21 +72,36 @@ export interface PlaceOrderArgs {
   items: OrderItem[]
   notes?: string
   expectedDelivery?: string
-  /** Inventory row to top up once the order is placed. */
+  /**
+   * Accepted for call-site compatibility but no longer used: inventory is
+   * moved by the restock_orders triggers, not from here. See the note on
+   * placeRestockOrder.
+   */
   inventoryId?: number | string
   currentStock?: number
 }
 
 /**
- * Emails the vendor, then records the order and tops the inventory row up.
+ * Emails the vendor, then records the order.
  *
  * The email goes first on purpose. It is the only step that cannot be undone,
  * so if it fails nothing has been written and the caller can simply retry. The
- * reverse order (the Restock page's) can leave an order row and inflated stock
- * behind for an email that never went out.
+ * reverse order (the Restock page's) can leave an order row behind for an
+ * email that never went out.
+ *
+ * Inventory is deliberately not touched. This used to write
+ * `current_stock: (currentStock ?? 0) + ordered` — a stale absolute value
+ * captured before the await chain, so anything that changed stock in between
+ * (a sale, the restock agent) was overwritten. It also credited the units at
+ * order time while receive_restock_order() credited them again on delivery,
+ * counting every restock twice.
+ *
+ * Since migration 033 the insert below fires trg_reserve_on_order, which adds
+ * the units to inventory.on_order; delivery converts them to current_stock.
+ * Both adjustments are relative and evaluated inside the database statement.
  */
 export async function placeRestockOrder({
-  vendor, items, notes = '', expectedDelivery = '', inventoryId, currentStock,
+  vendor, items, notes = '', expectedDelivery = '',
 }: PlaceOrderArgs): Promise<void> {
   if (!items.length) throw new Error('Nothing to order.')
   if (!vendor.email?.trim()) {
@@ -112,15 +127,4 @@ export async function placeRestockOrder({
     )
   }
 
-  if (inventoryId !== undefined) {
-    const ordered = items.reduce((s, i) => s + i.quantity, 0)
-    const { error: invError } = await supabase.from('inventory')
-      .update({ current_stock: (currentStock ?? 0) + ordered, last_updated: new Date().toISOString() })
-      .eq('id', inventoryId)
-    if (invError) {
-      throw new Error(
-        `Order placed and emailed, but the stock level could not be updated: ${invError.message}`
-      )
-    }
-  }
 }

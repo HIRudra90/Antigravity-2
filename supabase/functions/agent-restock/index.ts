@@ -45,12 +45,42 @@ Deno.serve(async (req) => {
     return new Response(JSON.stringify({ ok: true, skipped: 'agent disabled' }), { status: 200 })
   }
 
+  // 1b. Claim the run before ordering anything.
+  //
+  // A single HTTP call to this function was observed executing twice, which
+  // produced two agent_runs rows and two purchase orders for the same product.
+  // Nothing prevented two concurrent runs from reading the same low-stock list
+  // and both ordering against it. claim_agent_run inserts only if no run of
+  // this type landed inside the cooldown, and the test and insert are one
+  // statement, so exactly one caller can win (migration 034).
+  const { data: runId, error: claimErr } = await supabase
+    .rpc('claim_agent_run', { p_run_type: 'restock', p_trigger_source: triggerSource })
+
+  if (claimErr) {
+    return new Response(JSON.stringify({ ok: false, error: claimErr.message }), { status: 500 })
+  }
+  if (!runId) {
+    return new Response(
+      JSON.stringify({ ok: true, skipped: 'another restock run is already in progress' }),
+      { status: 200 },
+    )
+  }
+
   // 2. Low-stock candidates (same threshold Restock.tsx queue uses)
+  //
+  // on_order counts units already ordered from a vendor and not yet received
+  // (migration 033). Including it is what stops this agent re-ordering the same
+  // product on every run: previously the only thing removing an item from this
+  // list was crediting the ordered units straight into current_stock, which
+  // both double-counted on delivery and pretended goods had arrived. An item
+  // with stock in transit is not low.
   const { data: invRows } = await supabase
     .from('inventory')
-    .select('id, product_id, current_stock, reorder_level, products(id, name, family, unit_price)')
+    .select('id, product_id, current_stock, on_order, reorder_level, products(id, name, family, unit_price)')
 
-  const lowStock = (invRows || []).filter((i: any) => i.current_stock <= i.reorder_level)
+  const lowStock = (invRows || []).filter(
+    (i: any) => i.current_stock + (i.on_order ?? 0) <= i.reorder_level
+  )
 
   // 3. Active vendors
   const { data: vendorRows } = await supabase.from('vendors').select('*').eq('status', 'Active')
@@ -95,20 +125,25 @@ Deno.serve(async (req) => {
       // paid_at intentionally left null — payment happens on delivery confirmation
     })
 
-    // Credit inventory immediately so this item leaves the low-stock queue,
-    // same as the manual order flow in Restock.tsx.
-    await supabase.from('inventory')
-      .update({ current_stock: item.current_stock + suggestQty, last_updated: now })
-      .eq('id', item.id)
-
+    // Inventory is deliberately NOT touched here. The insert above fires
+    // trg_reserve_on_order, which adds these units to inventory.on_order, and
+    // delivery converts them into current_stock (migration 033).
+    //
+    // The previous code wrote `current_stock: item.current_stock + suggestQty`
+    // — a stale absolute value taken from the snapshot read before this loop,
+    // so two overlapping runs each wrote their own snapshot plus their own
+    // delta and the later write silently discarded the earlier one. The
+    // database now applies a relative adjustment inside the statement, so
+    // concurrent runs compose instead of clobbering.
     totalAmount += total
     done++
   }
 
-  await supabase.from('agent_runs').insert({
-    run_type: 'restock',
-    trigger_source: triggerSource,
-    summary: { done, skipped, errors, total_amount: totalAmount },
+  // Writes the result into the row claimed at the start rather than inserting
+  // a second one, so agent_runs holds exactly one row per run.
+  await supabase.rpc('finish_agent_run', {
+    p_id: runId,
+    p_summary: { done, skipped, errors, total_amount: totalAmount },
   })
 
   return new Response(JSON.stringify({ ok: true, done, skipped, errors, total_amount: totalAmount }), {
