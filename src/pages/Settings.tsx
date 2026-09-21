@@ -141,9 +141,15 @@ export default function Settings() {
   const [vendorRunResult,        setVendorRunResult]        = useState<string | null>(null)
 
   // ── Inventory sub-tab ────────────────────────────────────────────────────────
-  const [invSubTab,    setInvSubTab]    = useState<'sale' | 'stock'>('sale')
+  const [invSubTab,    setInvSubTab]    = useState<'sale' | 'stock' | 'simulate'>('sale')
   const [invProducts,  setInvProducts]  = useState<any[]>([])
   const [invLoading,   setInvLoading]   = useState(false)
+
+  // ── Simulation harness (migrations 036/037) ─────────────────────────────
+  const [simDays,    setSimDays]    = useState(7)
+  const [simRunning, setSimRunning] = useState(false)
+  const [simRows,    setSimRows]    = useState<any[]>([])
+  const [simError,   setSimError]   = useState<string | null>(null)
 
   // Record Sale
   const [saleProductId, setSaleProductId] = useState<number | ''>('')
@@ -244,6 +250,50 @@ export default function Settings() {
     if (activeTab === 'ai' && !modelStatus) loadModelStatus()
     if (activeTab === 'notifications') loadNotifCounts()
   }, [activeTab])
+
+  /**
+   * Advances the clock by N days of real sales, with stock drawing down.
+   *
+   * This writes rows — it is a test harness, not a preview. Sales land in
+   * sales_transactions, stock falls, revenue and the cash ledger move, and
+   * products that cross their reorder point fire the restock agent through
+   * the existing trg_low_stock webhook.
+   */
+  async function runSimulation(days: number) {
+    if (simRunning) return
+    setSimRunning(true); setSimError(null)
+    try {
+      const { data, error } = await supabase.rpc('simulate_sales_days', {
+        p_days: days, p_multiplier: 1.0,
+      })
+      if (error) throw error
+      setSimRows((data as any[]) || [])
+      // Stock and reorder state have moved, so the product table beneath is stale.
+      setInvProducts([]); loadInvProducts()
+    } catch (e: any) {
+      setSimError(e?.message || 'The simulation could not run.')
+    } finally {
+      setSimRunning(false)
+    }
+  }
+
+  /** Scatters products across their replenishment cycles before a test run. */
+  async function reshuffleCycle() {
+    if (simRunning) return
+    setSimRunning(true); setSimError(null)
+    try {
+      const { error } = await supabase.rpc('stagger_inventory_cycle', {
+        p_min_days: 9, p_max_days: 35, p_seed: null,
+      })
+      if (error) throw error
+      setSimRows([])
+      setInvProducts([]); loadInvProducts()
+    } catch (e: any) {
+      setSimError(e?.message || 'The reshuffle could not run.')
+    } finally {
+      setSimRunning(false)
+    }
+  }
 
   async function loadVendorPreview() {
     const { data } = await supabase.rpc('vendor_autopay_preview')
@@ -835,13 +885,91 @@ export default function Settings() {
                 </button>
               </div>
               <div style={{ display: 'flex', gap: 6, marginBottom: 24, background: 'rgba(255,255,255,0.04)', padding: 4, borderRadius: 'var(--r-md)', border: '1px solid var(--clr-border)', width: 'fit-content' }}>
-                {([{ id: 'sale', label: 'Record Sale', icon: ShoppingCart }, { id: 'stock', label: 'Manage Stock', icon: Edit3 }] as const).map(t => (
+                {([{ id: 'sale', label: 'Record Sale', icon: ShoppingCart }, { id: 'stock', label: 'Manage Stock', icon: Edit3 }, { id: 'simulate', label: 'Simulate Days', icon: Calendar }] as const).map(t => (
                   <button key={t.id} onClick={() => setInvSubTab(t.id)} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 14px', borderRadius: 'calc(var(--r-md) - 2px)', fontSize: 13, fontWeight: 600, border: 'none', cursor: 'pointer', transition: 'all 0.2s', background: invSubTab === t.id ? 'linear-gradient(135deg,#6C63FF,#846cff)' : 'transparent', color: invSubTab === t.id ? '#fff' : 'var(--clr-text-muted)' }}
                     onMouseEnter={e => { if (invSubTab !== t.id) (e.currentTarget as HTMLElement).style.boxShadow = '0 0 0 1px rgba(108,99,255,0.4), 0 0 12px rgba(108,99,255,0.3)' }}
                     onMouseLeave={e => { (e.currentTarget as HTMLElement).style.boxShadow = '' }}
                   ><t.icon size={14} /> {t.label}</button>
                 ))}
               </div>
+
+              {invSubTab === 'simulate' && (
+                <div style={{ maxWidth: 760 }}>
+                  <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 6, lineHeight: 1.6 }}>
+                    Advances the clock by whole days of realistic sales, drawn from each product&rsquo;s own
+                    demand. Stock falls, revenue and cash move, and products cross their reorder points on
+                    different days &mdash; so the restock agent can be watched behaving normally instead of
+                    reacting to the whole catalogue at once.
+                  </p>
+                  <p style={{ fontSize: 12, color: '#f59e0b', marginBottom: 18, lineHeight: 1.6 }}>
+                    This writes real rows. Simulated days are dated forward from the last sale, so they can
+                    run ahead of today&rsquo;s date &mdash; that is what fast-forwarding means.
+                  </p>
+
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 16 }}>
+                    {[1, 7, 30].map(d => (
+                      <button key={d} className="btn btn-ghost" disabled={simRunning}
+                        onClick={() => { setSimDays(d); runSimulation(d) }}
+                        style={{ opacity: simRunning ? 0.5 : 1 }}>
+                        <Calendar size={14} /> Advance {d} day{d === 1 ? '' : 's'}
+                      </button>
+                    ))}
+                    <span style={{ width: 1, height: 26, background: 'rgba(255,255,255,0.12)' }} />
+                    <input
+                      type="number" min={1} max={90} value={simDays}
+                      onChange={e => setSimDays(Math.max(1, Math.min(90, Number(e.target.value) || 1)))}
+                      className="glass-input" style={{ width: 74, fontSize: 13, padding: '7px 10px' }}
+                    />
+                    <button className="btn btn-primary" disabled={simRunning}
+                      onClick={() => runSimulation(simDays)}>
+                      {simRunning ? 'Running…' : `Run ${simDays} days`}
+                    </button>
+                    <span style={{ width: 1, height: 26, background: 'rgba(255,255,255,0.12)' }} />
+                    <button className="btn btn-ghost" disabled={simRunning} onClick={reshuffleCycle}
+                      title="Scatter products across their replenishment cycles">
+                      <RefreshCw size={14} /> Reshuffle cycle
+                    </button>
+                  </div>
+
+                  {simError && (
+                    <div style={{ padding: '10px 14px', borderRadius: 10, marginBottom: 14, fontSize: 12.5,
+                      background: 'rgba(244,63,94,0.1)', border: '1px solid rgba(244,63,94,0.3)', color: '#f43f5e' }}>
+                      {simError}
+                    </div>
+                  )}
+
+                  {simRows.length > 0 && (
+                    <div style={{ overflowX: 'auto' }}>
+                      <table className="data-table">
+                        <thead>
+                          <tr>
+                            <th>Day</th><th>Products sold</th><th>Units</th>
+                            <th>Revenue</th><th>Lost to stockout</th><th>Crossed reorder</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {simRows.map((r: any) => (
+                            <tr key={r.day}>
+                              <td style={{ whiteSpace: 'nowrap' }}>{r.day}</td>
+                              <td>{r.rows_inserted}</td>
+                              <td>{Number(r.units_sold).toLocaleString()}</td>
+                              <td style={{ color: '#22d3a8', fontWeight: 600 }}>{locale.moneyShort(Number(r.revenue))}</td>
+                              {/* Unmet demand is the point of the exercise: it is
+                                  what a reorder level set too low actually costs. */}
+                              <td style={{ color: Number(r.lost_units) > 0 ? '#f43f5e' : 'var(--clr-text-muted)', fontWeight: Number(r.lost_units) > 0 ? 700 : 400 }}>
+                                {Number(r.lost_units).toLocaleString()}
+                              </td>
+                              <td style={{ color: Number(r.crossed_reorder) > 0 ? '#f59e0b' : 'var(--clr-text-muted)' }}>
+                                {r.crossed_reorder}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {invSubTab === 'sale' && (
                 <div style={{ maxWidth: 560 }}>
