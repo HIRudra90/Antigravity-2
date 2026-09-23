@@ -192,7 +192,9 @@ export default function Payment() {
   >(null)
 
   // Financial totals
-  const [totalRevenue, setTotalRevenue] = useState(0)
+  // totalRevenue is derived from the server aggregate further down, NOT held
+  // in state. See the note where it is computed: summing the fetched sales
+  // array compared 200 rows of revenue against a full-epoch expense total.
   const [totalShipping, setTotalShipping] = useState(0)
   const [totalProcurement, setTotalProcurement] = useState(0)
 
@@ -578,19 +580,23 @@ export default function Payment() {
 
       const stamp = stampOf
 
-      // ── Revenue ledger
-      let rev = 0
+      // ── Revenue ledger (display rows only)
+      //
+      // These are the sales rows this page fetched for its transaction list,
+      // and that query carries `.limit(200)`. Their total is NOT the
+      // business's revenue and there is deliberately no running sum here any
+      // more — one used to feed the Total Revenue card, which is how a display
+      // limit became an accounting figure. totalRevenue comes from the
+      // server-side ledger aggregate instead; see its derivation below.
       const saleLedger = salesArr.map(s => {
         const p = Array.isArray(s.products) ? s.products[0] : s.products
         const amount = Math.round((s.quantity_sold || 0) * parseFloat(p?.unit_price || '0'))
-        rev += amount
         const { at, exact } = saleStamp(s)
         return { id: `TXN-${s.id}`, type: 'income', category: 'Sale', description: p?.name || 'Product Sale', family: p?.family || '', amount, date: s.sale_date, sortAt: at, hasTime: exact, status: 'Completed' }
       })
       // Money you add is capital, not a sale. It raises the spendable balance
       // and appears in the flow below, but counting it as revenue would flatter
       // the profit figure with your own deposits.
-      setTotalRevenue(rev)
 
       // ── Shipping ledger
       let ship = 0
@@ -670,64 +676,42 @@ export default function Payment() {
         .sort((a: any, b: any) => (b.sortAt || 0) - (a.sortAt || 0))
       setAllTransactions(combined)
 
-      // ── Monthly chart — fully computed from real records (no RPC dependency)
+      // ── Monthly chart
+      //
+      // Aggregated server-side, NOT bucketed from the arrays above. Those are
+      // the page's display fetches and each carries .limit(200); six months of
+      // history drawn from the most recent 200 sales is about a day and a half
+      // of trading in the newest bar and nothing in the other five. Same
+      // defect that made the Total Revenue card read $225,158 against $23.7M
+      // of expenses -- a page limit standing in for an accounting figure.
+      const { data: flowRows } = await supabase.rpc('get_monthly_cashflow', { p_months: 6 })
+      const flowByMonth: Record<string, { income: number; expenses: number }> = {}
+      for (const r of (flowRows as any[]) || []) {
+        const d = new Date(r.month_start + 'T00:00:00')
+        flowByMonth[`${d.getFullYear()}-${d.getMonth()}`] = {
+          income: Number(r.income) || 0,
+          expenses: Number(r.expenses) || 0,
+        }
+      }
+
       const last6: { key: string; label: string }[] = []
       for (let i = 5; i >= 0; i--) {
         const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
         last6.push({ key: `${d.getFullYear()}-${d.getMonth()}`, label: d.toLocaleString('en', { month: 'short' }) })
       }
 
-      const revByMonth: Record<string, number> = {}
-      salesArr.forEach(s => {
-        if (!s.sale_date) return
-        const d = new Date(s.sale_date)
-        const key = `${d.getFullYear()}-${d.getMonth()}`
-        const p = Array.isArray(s.products) ? s.products[0] : s.products
-        revByMonth[key] = (revByMonth[key] || 0) + (s.quantity_sold || 0) * parseFloat(p?.unit_price || '0')
-      })
-
-      const shipByMonth: Record<string, number> = {}
-      shipArr.forEach(s => {
-        if (!s.created_at) return
-        const d = new Date(s.created_at)
-        const key = `${d.getFullYear()}-${d.getMonth()}`
-        shipByMonth[key] = (shipByMonth[key] || 0) + parseFloat(s.price || '0')
-      })
-
-      const procByMonth: Record<string, number> = {}
-      restockArr.forEach(r => {
-        const dateStr = r.ordered_at || r.created_at
-        if (!dateStr) return
-        const d = new Date(dateStr)
-        const key = `${d.getFullYear()}-${d.getMonth()}`
-        procByMonth[key] = (procByMonth[key] || 0) + (Number(r.total_cost) || 0)
-      })
-
-      manualArr.forEach((m: any) => {
-        const dateStr = m.date || m.created_at
-        if (!dateStr) return
-        const d = new Date(dateStr)
-        const key = `${d.getFullYear()}-${d.getMonth()}`
-        const amt = Number(m.amount) || 0
-        if (m.type === 'income') revByMonth[key] = (revByMonth[key] || 0) + amt
-        else procByMonth[key] = (procByMonth[key] || 0) + amt
-      })
-
-      // Salaries paid, bucketed by the month they were paid in. This used to
-      // add the full monthly payroll to every one of the last six months
-      // regardless of whether anyone was paid, which is what kept the expense
-      // line non-zero even with the books freshly opened.
-      const payByMonth: Record<string, number> = {}
-      salArr.forEach((p: any) => {
-        if (!p.paid_at || stampOf(p.paid_at) < epoch) return
-        const d = new Date(p.paid_at)
-        const key = `${d.getFullYear()}-${d.getMonth()}`
-        payByMonth[key] = (payByMonth[key] || 0) + (Number(p.amount) || 0)
-      })
+      // The four per-month buckets that used to be built here -- revByMonth,
+      // shipByMonth, procByMonth and payByMonth -- are gone. Each one summed a
+      // page fetch capped at 200 rows, which is why the chart under a $397M
+      // business could only ever draw about a day and a half of trading. Every
+      // movement they were reconstructing is already a cash_ledger row, so
+      // get_monthly_cashflow aggregates the ledger directly and the numbers
+      // cannot drift from the totals above them again.
 
       setMonthlyData(last6.map(({ key, label }) => {
-        const income   = Math.round(revByMonth[key] || 0)
-        const expenses = Math.round((shipByMonth[key] || 0) + (procByMonth[key] || 0) + (payByMonth[key] || 0))
+        const f = flowByMonth[key] || { income: 0, expenses: 0 }
+        const income   = Math.round(f.income)
+        const expenses = Math.round(f.expenses)
         return { month: label, income, expenses, profit: income - expenses }
       }))
 
@@ -737,7 +721,12 @@ export default function Payment() {
         { name: 'Payroll',     value: Math.max(Math.round(payrollTotal), 1), color: '#a78bfa' },
         { name: 'Procurement', value: Math.max(Math.round(procCommitted), 1), color: '#f43f5e' },
         { name: 'Shipping',    value: Math.max(Math.round(Number(exp0?.shipping ?? ship) || 0), 1), color: '#f59e0b' },
-        { name: 'Operations',  value: Math.max(Math.round(rev * 0.04), 1), color: '#6C63FF' },
+        // "Operations" used to sit here as Math.round(rev * 0.04) — a slice of
+        // the expense donut computed from revenue, with no rent, utility or
+        // overhead record behind it anywhere in the database. It moved when
+        // revenue moved and never when a cost was incurred, which is the
+        // opposite of what an expense does. The breakdown now shows the three
+        // categories the cash ledger actually records.
       ])
 
       setVendors(vendorArr)
@@ -754,6 +743,21 @@ export default function Payment() {
       if (!silent) setLoading(false)
     }
   }
+
+  // Revenue comes from the cash ledger's server-side total, scoped to the same
+  // accounting epoch the expense figures use.
+  //
+  // It used to be the sum of `salesArr`, the sales rows this page fetches for
+  // its transaction list — and that query carries `.limit(200)`. So the card
+  // compared about ninety minutes of revenue against a full-epoch expense
+  // aggregate, and reported a catastrophic loss on a profitable business:
+  // $225,158 of revenue against $23,769,701 of expenses, a net of -$23.5M,
+  // when actual revenue over the same window was $397,328,233.
+  //
+  // A display limit had become an accounting figure. Both sides of this
+  // subtraction now come from the same server-side aggregate, so raising or
+  // lowering the transaction list's page size cannot move the P&L again.
+  const totalRevenue   = Math.round(cash?.revenue ?? 0)
 
   // Payroll contributes what has actually been paid since the books opened,
   // not the standing monthly cost.
@@ -794,11 +798,7 @@ export default function Payment() {
         tier: 'Variable Cost',
         insight: `${shippingCount} shipment${shippingCount !== 1 ? 's' : ''} booked. Tracked live from the Logistics page.`,
       },
-      Operations: {
-        count: 1,
-        tier: 'Estimated',
-        insight: 'Estimated overhead (4% of revenue) — rent, utilities, and other costs not yet itemized in the ledger.',
-      },
+
     }
     const meta = map[name] || { count: 0, tier: 'Expense', insight: '' }
     const value = expenseBreakdown.find(e => e.name === name)?.value || 0
@@ -1901,7 +1901,6 @@ export default function Payment() {
                   { label: 'Payroll Costs',       value: fmt(totalPayroll),        pct: totalRevenue > 0 ? (totalPayroll / totalRevenue) * 100 : 0,      color: '#a78bfa' },
                   { label: 'Procurement Costs',   value: fmt(totalProcurement),    pct: totalRevenue > 0 ? (totalProcurement / totalRevenue) * 100 : 0,  color: '#f43f5e' },
                   { label: 'Shipping Costs',      value: fmt(totalShipping),       pct: totalRevenue > 0 ? (totalShipping / totalRevenue) * 100 : 0,     color: '#f59e0b' },
-                  { label: 'Operating Expenses',  value: fmt(totalRevenue * 0.04), pct: 4,                    color: '#6C63FF' },
                   { label: 'Net Profit',          value: fmt(Math.abs(netProfit)), pct: Math.abs(profitMargin), color: netProfit >= 0 ? '#a78bfa' : '#f43f5e' },
                 ].map(row => (
                   <div key={row.label}>
