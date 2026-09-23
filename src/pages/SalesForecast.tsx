@@ -19,12 +19,24 @@ import {
   CheckCircle, Eye, X, ChevronDown, ChevronUp
 } from 'lucide-react'
 
-// Reorder policy for the stock recommendations, as a classic (s, S) rule.
-// These two must stay apart: raise an alert below the reorder point, but order
-// up to a strictly higher level. If an order only refills to the trigger, the
-// item drops straight back under it and the alert repeats forever.
-const REORDER_POINT_DAYS = 30   // s — below this many days of cover, act
-const ORDER_UP_TO_DAYS   = 45   // S — order enough to reach this much cover
+// The reorder policy is NOT defined here.
+//
+// This file used to carry its own (s, S) rule — alert below 30 days of cover,
+// order up to 45 — and that was the whole problem. The database already holds
+// a per-product reorder_level, derived in migration 028 as
+//
+//     (mean daily demand x 7-day lead time) + 1.65 x sigma x sqrt(lead time)
+//
+// which works out to roughly 8 days of cover, not 30. The Restock queue and
+// the autonomous restock agent both test against it. This page tested against
+// 30 days instead, so it reported 22 CRITICAL products while the Restock page
+// showed an empty queue — two screens reading the same rows and reaching
+// opposite conclusions, because they were applying different policies.
+//
+// One policy, held in the database, read by everything. The (s, S) separation
+// that the old constants existed to guarantee still holds: the trigger is
+// reorder_level and the order-up-to level is 3x reorder_level, so a refilled
+// product lands well clear of the point that raised the alert.
 
 
 export default function SalesForecast() {
@@ -42,6 +54,12 @@ export default function SalesForecast() {
     sentiment_multiplier: number
     oil_price: number
     seasonal_factors: number[]
+    // What the trend fit concluded. Optional so an older backend, which had no
+    // trend term at all, still renders.
+    trend_monthly_growth?: number
+    trend_r2?: number
+    trend_applied?: boolean
+    trend_months_used?: number
   } | null>(null)
 
   // New interactive prediction pipeline state
@@ -329,19 +347,32 @@ export default function SalesForecast() {
   }
 
   /**
-   * Months whose sales data covers every day of the month.
+   * Months of *elapsed* sales history whose data covers every day.
+   *
+   * Two separate conditions, and both are needed:
    *
    * A partial month looks like a collapse in revenue rather than missing data,
    * which is exactly what the chart was drawing for June (20 of 30 days) and
    * what both forecast lines were anchoring to.
+   *
+   * And a month that has not finished yet is not history at all. The sales
+   * simulator writes forward-dated rows, so the table runs weeks past today —
+   * and `is_complete` only asks whether a month has as many sale-days as it
+   * has days, never whether it has actually happened. That let September (7
+   * days of it still in the future) and October (all of it) through as
+   * recorded actuals, so the chart drew the model "forecasting" 24.9M for a
+   * September it was simultaneously showing 110.6M of actual sales in, and
+   * anchored the whole forecast to October — a month inside its own forecast
+   * window. Require the month to have ended.
    */
   async function completeSalesMonths(): Promise<
     { label: string; first: string; last: string; days: number; revenue: number; units: number }[]
   > {
     const { data, error } = await supabase.rpc('get_monthly_sales_coverage', { months_back: 24 })
     if (error || !data) return []
+    const todayKey = new Date().toLocaleDateString('en-CA')   // local YYYY-MM-DD
     return (data as any[])
-      .filter(r => r.is_complete)
+      .filter(r => r.is_complete && String(r.month_end) <= todayKey)
       .map(r => ({
         label: r.month_key,
         first: r.month_start,
@@ -495,6 +526,19 @@ export default function SalesForecast() {
             body: {
               last_actual_revenue: lastActual,
               product_families: ['GROCERY I', 'BEVERAGES', 'DAIRY', 'PRODUCE', 'FROZEN FOODS'],
+              // The whole history, not just the last figure.
+              //
+              // completeSalesMonths() already loads up to 24 months and this
+              // used to throw all but the final value away — so the model was
+              // asked to forecast a business it could see exactly one month
+              // of. With nothing to fit a trend to, its seasonal factors
+              // (which average to 1.0) could only redistribute that one month
+              // across the horizon, and a business compounding 10% a month got
+              // a forecast that dipped.
+              revenue_history: months.map(m => ({
+                month: m.first.slice(0, 7),
+                revenue: m.revenue,
+              })),
             },
           })
           setRevenueForecast(data)
@@ -525,7 +569,7 @@ export default function SalesForecast() {
       const { data: productData } = await supabase
         .from('products').select('id, name, family, unit_price')
       const { data: inventoryData } = await supabase
-        .from('inventory').select('id, product_id, current_stock, reorder_level')
+        .from('inventory').select('id, product_id, current_stock, on_order, reorder_level')
       // Observed sales velocity per product. The model predicts at product-family
       // scale (one number for a whole family, on the training set's scale), so
       // its per-product figure can be many times the real rate. Recorded sales
@@ -563,24 +607,56 @@ export default function SalesForecast() {
         // order by an order of magnitude.
         const dailyDemand = observedDaily > 0 ? observedDaily : modelDaily
         const currentStockLive = inv.current_stock ?? f.current_stock ?? 0
+        const onOrderLive = inv.on_order ?? 0
         const reorderLevelLive = inv.reorder_level ?? f.reorder_level ?? 0
-        const daysOfStock = dailyDemand > 0 ? currentStockLive / dailyDemand : 999
-        const unitPrice = prod.unit_price ?? 0
-        const urgency = currentStockLive === 0 ? 'CRITICAL'
-          : daysOfStock < REORDER_POINT_DAYS / 2 ? 'CRITICAL'
-          : daysOfStock < REORDER_POINT_DAYS ? 'HIGH'
-          : daysOfStock < 60 ? 'MEDIUM' : 'LOW'
 
-        // Quantity that actually clears the alert. The stored PPO figure is
-        // what the model returned against whatever the stock level was at the
-        // time of its pipeline run, and it is never recomputed -- ordering it
-        // left every item still under the reorder point, so the same alert
-        // reappeared on the next refresh. Order up to ORDER_UP_TO_DAYS of
-        // cover instead, so the condition that raised the alert is resolved.
-        const orderUpToQty = dailyDemand > 0
-          ? Math.max(0, Math.ceil(ORDER_UP_TO_DAYS * dailyDemand - currentStockLive))
-          : Math.max(0, (reorderLevelLive || 0) * 2 - currentStockLive)
-        const needsAction = urgency === 'CRITICAL' || urgency === 'HIGH'
+        // Urgency is judged on the stock position, not the shelf.
+        //
+        // An empty shelf with a delivery already on the way is not the same
+        // problem as an empty shelf with nothing ordered, and only the second
+        // needs a human. Judging on current_stock alone made this page shout
+        // CRITICAL at ten products whose replacements were already in transit
+        // — while the Restock queue, which does count on_order, correctly
+        // showed nothing to do.
+        //
+        // The shelf figure is still reported separately, because "you have
+        // none right now" remains true and worth seeing.
+        const stockPosition = currentStockLive + onOrderLive
+        const daysOfStock = dailyDemand > 0 ? stockPosition / dailyDemand : 999
+        const daysOnShelf = dailyDemand > 0 ? currentStockLive / dailyDemand : 999
+        const unitPrice = prod.unit_price ?? 0
+
+        // THE REORDER POINT IS THE ONE IN THE DATABASE.
+        //
+        // This page used to invent its own: alert below 30 days of cover,
+        // order up to 45. Nothing else in the system agrees with that. The
+        // Restock queue and the autonomous agent both test
+        //
+        //     current_stock + on_order <= reorder_level
+        //
+        // against the reorder_level migration 028 derived per product as
+        // (mean daily demand x 7-day lead time) + safety stock — about 8 days
+        // of cover, not 30. So this page called 22 products CRITICAL that the
+        // real policy considered fully stocked, while the Restock page showed
+        // an empty queue. Frozen Peas: 703 units against a reorder level of
+        // 635, flagged CRITICAL here and absent there.
+        //
+        // Two reorder policies in one system is the bug. There is one policy,
+        // it lives in the database, and this page now reads it like everything
+        // else does — same trigger, same urgency bands, same order size.
+        const isLow = reorderLevelLive > 0 && stockPosition <= reorderLevelLive
+        const coverRatio = reorderLevelLive > 0 ? stockPosition / reorderLevelLive : 0
+        const urgency = !isLow ? 'LOW'
+          : currentStockLive === 0 ? 'CRITICAL'
+          : coverRatio <= 0.5 ? 'CRITICAL'
+          : coverRatio <= 0.8 ? 'HIGH'
+          : 'MEDIUM'
+
+        // Order size, matching Restock.tsx and the agent exactly: three times
+        // the reorder level, net of what is already on its way. Netting off
+        // on_order is what stops approving twice in a row ordering double.
+        const orderUpToQty = Math.max(0, Math.round(reorderLevelLive * 3) - onOrderLive)
+        const needsAction = isLow && orderUpToQty > 0
 
         return {
           ...f,
@@ -593,13 +669,25 @@ export default function SalesForecast() {
           observed_daily_demand: Math.round(observedDaily * 10) / 10,
           demand_basis: observedDaily > 0 ? 'recorded sales' : 'model forecast',
           days_of_stock: Math.round(daysOfStock),
+          days_on_shelf: Math.round(daysOnShelf),
           forecasted_revenue: Math.round(totalDemand * unitPrice),
           current_stock_live: currentStockLive,
+          on_order_live: onOrderLive,
+          stock_position: stockPosition,
           reorder_level_live: reorderLevelLive,
+          cover_ratio: Math.round(coverRatio * 100) / 100,
+          // Whether the stored model forecast is on this product's scale at
+          // all. It is a per-FAMILY number, so for a single product it is
+          // routinely several times the real rate — 11,493 units/30d against a
+          // product selling 2,040. Flagged rather than silently displayed as
+          // though it were a product forecast.
+          model_scale_ratio: observedDaily > 0 && modelDaily > 0
+            ? Math.round((modelDaily / observedDaily) * 10) / 10
+            : null,
           ppo_reorder_qty: f.optimal_reorder_qty || 0,
           recommended_qty: needsAction ? orderUpToQty : 0,
           days_after_restock: dailyDemand > 0
-            ? Math.round((currentStockLive + orderUpToQty) / dailyDemand)
+            ? Math.round((stockPosition + orderUpToQty) / dailyDemand)
             : 999,
           urgency,
         }
@@ -980,7 +1068,6 @@ export default function SalesForecast() {
 
   // Line chart — actual sales (historical) + XGBoost base + PPO+LLM adjusted
   const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-  const currentMonthName = MONTHS[new Date().getMonth()]
 
   // Sentiment: prefer real forecast API result, fall back to avg from pipeline runs
   const activeSentiment = revenueForecast?.sentiment_multiplier
@@ -1047,7 +1134,15 @@ export default function SalesForecast() {
   const monthBeforeForecast = new Date(forecastDates[0].getFullYear(), forecastDates[0].getMonth() - 1, 1)
   const forecastJoinsActuals = lastActualKey === monthKey(monthBeforeForecast)
 
+  // One formatter for every month label on this chart. The "Today" marker is
+  // matched against a tick by string equality, so it has to be built the same
+  // way the ticks are — a bare "Nov" silently matches nothing once the
+  // timeline crosses a year end and the ticks become "Nov '26".
   const multiYear = timelineStart.getFullYear() !== lastForecast.getFullYear()
+  const monthLabel = (d: Date) =>
+    multiYear ? `${MONTHS[d.getMonth()]} '${String(d.getFullYear()).slice(2)}` : MONTHS[d.getMonth()]
+  const currentMonthName = monthLabel(today)
+
   const combinedChartData = Array.from({ length: steps + 1 }, (_, i) => {
     const d = new Date(timelineStart.getFullYear(), timelineStart.getMonth() + i, 1)
     const k = monthKey(d)
@@ -1055,7 +1150,7 @@ export default function SalesForecast() {
     const actual = actualByMonth.has(k) ? (actualByMonth.get(k) as number) : null
     const isJoin = forecastJoinsActuals && k === lastActualKey && actual !== null
     return {
-      month: multiYear ? `${MONTHS[d.getMonth()]} '${String(d.getFullYear()).slice(2)}` : MONTHS[d.getMonth()],
+      month: monthLabel(d),
       actual,
       xgboost: fc ? fc.xgboost : (isJoin ? actual : null),
       adjusted: fc ? fc.adjusted : (isJoin ? actual : null),
@@ -1253,6 +1348,19 @@ export default function SalesForecast() {
                   crash in sales. */}
               <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginTop: -4, marginBottom: 8 }}>
                 Forecast {forecastRows.length > 0 ? `${forecastRows[0].month}–${forecastRows[forecastRows.length - 1].month} ${today.getFullYear()}` : ''} (next 90 days from today)
+                {/* Show the trend the model fitted, so the direction of the
+                    forecast line is something you can check rather than take
+                    on trust. */}
+                {revenueForecast?.trend_applied && (
+                  <span style={{ color: (revenueForecast.trend_monthly_growth ?? 0) >= 0 ? '#22d3a8' : '#f43f5e' }}>
+                    {' · '}trend {(revenueForecast.trend_monthly_growth ?? 0) >= 0 ? '+' : ''}
+                    {(((revenueForecast.trend_monthly_growth ?? 0)) * 100).toFixed(1)}%/mo
+                    <span style={{ color: 'rgba(255,255,255,0.35)' }}>
+                      {' '}(fitted on {revenueForecast.trend_months_used ?? 0} months, R²{' '}
+                      {(revenueForecast.trend_r2 ?? 0).toFixed(3)})
+                    </span>
+                  </span>
+                )}
                 {staleMonths > 0 && (
                   <span style={{ color: '#f59e0b' }}>
                     {' · '}sales data ends {lastActualDate ? `${MONTHS[lastActualDate.getMonth()]} ${lastActualDate.getFullYear()}` : ''}
@@ -1610,7 +1718,7 @@ export default function SalesForecast() {
                             unit_cost: unitCost,
                           }],
                           total_cost: total, status: 'Pending',
-                          notes: `AI Fix-All restock — ${item.urgency} · to ${ORDER_UP_TO_DAYS}d cover`,
+                          notes: `AI Fix-All restock — ${item.urgency} · to 3x reorder level (${item.reorder_level_live})`,
                           expected_delivery: delivDate.toISOString().split('T')[0],
                           ordered_at: now,
                         })
@@ -1673,8 +1781,40 @@ export default function SalesForecast() {
               )}
 
               {stockActions.length === 0 ? (
+                /* Two different empty states, because they mean opposite
+                   things. "No recommendations" because the pipeline has never
+                   run is a setup problem. "No recommendations" because every
+                   product is above its reorder point is the system working,
+                   and saying "run the pipeline" there — as this used to,
+                   unconditionally — sends you to fix something that is not
+                   broken. */
                 <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--clr-text-muted)', fontSize: 13 }}>
-                  {dashLoading ? 'Computing recommendations...' : 'Run the pipeline on your products to generate AI-driven restock recommendations.'}
+                  {dashLoading ? 'Computing recommendations…' : productForecasts.length === 0 ? (
+                    'Run the pipeline on your products to generate AI-driven restock recommendations.'
+                  ) : (() => {
+                    const nearest = [...productForecasts]
+                      .filter((f: any) => f.reorder_level_live > 0)
+                      .sort((a: any, b: any) => a.cover_ratio - b.cover_ratio)[0]
+                    return (
+                      <>
+                        <div style={{ color: '#22d3a8', fontWeight: 600, marginBottom: 6 }}>
+                          <CheckCircle size={14} style={{ verticalAlign: -2, marginRight: 6 }} />
+                          Nothing to order — all {productForecasts.length} products are above their reorder point.
+                        </div>
+                        {nearest && (
+                          <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>
+                            Closest is <strong style={{ color: 'rgba(255,255,255,0.7)' }}>{nearest.product_name}</strong> at{' '}
+                            {nearest.stock_position.toLocaleString()} units against a{' '}
+                            {nearest.reorder_level_live.toLocaleString()}-unit reorder point
+                            {' '}({Math.round(nearest.cover_ratio * 100)}%).
+                          </div>
+                        )}
+                        <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 8 }}>
+                          Same reorder point the Restock queue and the autonomous agent use.
+                        </div>
+                      </>
+                    )
+                  })()}
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 12, overflowY: 'auto', maxHeight: 340, paddingRight: 4 }}>
@@ -1709,29 +1849,50 @@ export default function SalesForecast() {
                             +{item.recommended_qty}
                           </div>
                           <div style={{ fontSize: 10, color: 'var(--clr-text-muted)' }}>
-                            units → {ORDER_UP_TO_DAYS}d cover
+                            units → {item.days_after_restock > 500 ? '∞' : `${item.days_after_restock}d`} cover
                           </div>
-                          {item.ppo_reorder_qty > 0 && item.ppo_reorder_qty !== item.recommended_qty && (
-                            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', marginTop: 2 }}>
-                              PPO said +{item.ppo_reorder_qty}
-                            </div>
-                          )}
+                          {/* The stored PPO figure used to sit here as "PPO
+                              said +5". It is whatever the model returned
+                              against whatever the stock level was during some
+                              past pipeline run, and it is never recomputed —
+                              so next to a live +2,355 it read as though the AI
+                              had recommended 5 units. A stale number presented
+                              as a current recommendation is worse than no
+                              number. */}
                         </div>
                       </div>
                       <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)', lineHeight: 1.6 }}>
                         Stock <strong style={{ color: item.current_stock_live < item.reorder_level_live ? '#f43f5e' : '#fff' }}>{item.current_stock_live}</strong> units
-                        ({item.days_of_stock > 500 ? '∞' : item.days_of_stock} days supply)
+                        {/* Without this an empty shelf reads as a crisis even
+                            when the replacement is already on a lorry. */}
+                        {item.on_order_live > 0 && (
+                          <strong style={{ color: '#a78bfa' }}> +{item.on_order_live.toLocaleString()} on order</strong>
+                        )}
+                        {' '}({item.days_of_stock > 500 ? '∞' : item.days_of_stock} days supply)
+                        {' '}· Reorder level <strong style={{ color: '#fff' }}>{item.reorder_level_live.toLocaleString()}</strong>
+                        <span style={{ color: 'rgba(255,255,255,0.35)' }}> ({Math.round(item.cover_ratio * 100)}% of it)</span>
                         · Sells <strong style={{ color: '#00D4FF' }}>{item.daily_demand}/day</strong>
                         <span style={{ color: 'rgba(255,255,255,0.35)' }}> ({item.demand_basis})</span>
-                        · XGBoost forecast: <strong style={{ color: '#a78bfa' }}>{item.total_forecasted_demand} units/{item.forecast_period}</strong>
                         · Sentiment: <strong style={{ color: item.sentiment_multiplier > 1.02 ? '#22d3a8' : item.sentiment_multiplier < 0.98 ? '#f43f5e' : '#fff' }}>
                           x{parseFloat(item.sentiment_multiplier).toFixed(3)} {item.sentiment_multiplier > 1.02 ? '↑' : item.sentiment_multiplier < 0.98 ? '↓' : '─'}
                         </strong>
                       </div>
+                      {/* The XGBoost total is a per-FAMILY forecast. Printed
+                          beside a single product's daily rate it looked like a
+                          product forecast and was routinely several times too
+                          big — 11,493 units/30d for something selling 2,040.
+                          It is shown only when it is actually on this
+                          product's scale, and labelled when it is not. */}
+                      {item.model_scale_ratio !== null && item.model_scale_ratio <= 2 && item.model_scale_ratio >= 0.5 && (
+                        <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', marginTop: 3 }}>
+                          XGBoost forecast: <strong style={{ color: '#a78bfa' }}>{item.total_forecasted_demand} units/{item.forecast_period}</strong>
+                        </div>
+                      )}
                       <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginTop: 4 }}>
                         Ordering <strong style={{ color: '#22d3a8' }}>+{item.recommended_qty}</strong> takes it to{' '}
-                        <strong style={{ color: '#fff' }}>{item.days_after_restock}</strong> days — clear of the{' '}
-                        {REORDER_POINT_DAYS}-day reorder point, so it leaves this list.
+                        <strong style={{ color: '#fff' }}>{item.stock_position + item.recommended_qty}</strong> units —
+                        clear of its <strong style={{ color: '#fff' }}>{item.reorder_level_live.toLocaleString()}</strong>-unit
+                        reorder point, so it leaves this list.
                       </div>
                       <div style={{ fontSize: 10, color: `rgba(${glowColor},0.7)`, marginTop: 6, fontWeight: 500 }}>Click to analyze →</div>
                     </div>

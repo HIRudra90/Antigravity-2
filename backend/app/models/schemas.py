@@ -58,11 +58,24 @@ class MarketInsightResponse(BaseModel):
     family: str
     generated_at: str
 
+class MonthRevenue(BaseModel):
+    """One completed month of actual revenue."""
+    month: str = Field(..., description="YYYY-MM")
+    revenue: float = Field(..., ge=0)
+
 class RevenueForecastRequest(BaseModel):
     last_actual_revenue: float = Field(0.0, description="Last month's actual revenue (for scaling)")
     product_families: Optional[List[str]] = Field(
         default=["GROCERY I", "BEVERAGES", "DAIRY", "PRODUCE", "FROZEN FOODS"],
         description="Product families to aggregate forecast across"
+    )
+    revenue_history: Optional[List[MonthRevenue]] = Field(
+        default=None,
+        description=(
+            "Completed months of actual revenue, oldest first. Used to fit the "
+            "growth trend. Without it the forecast has no way to see a trend "
+            "and can only redistribute last month's figure across the horizon."
+        ),
     )
 
 class RevenueForecastResponse(BaseModel):
@@ -72,6 +85,12 @@ class RevenueForecastResponse(BaseModel):
     sentiment_analysis: str
     oil_price: float
     seasonal_factors: List[float]
+    # What the trend fit concluded, so the caller can show its reasoning
+    # instead of asserting a number.
+    trend_monthly_growth: float = 0.0   # e.g. 0.102 for +10.2%/month
+    trend_r2: float = 0.0
+    trend_applied: bool = False
+    trend_months_used: int = 0
 
 class BacktestRequest(BaseModel):
     """One holdout window whose real outcome the caller already knows."""
@@ -93,3 +112,24 @@ class BacktestResponse(BaseModel):
     oil_price_used: float
     per_family: List[FamilyBacktest]
     predicted_grand_total: float
+
+class FamilyWeight(BaseModel):
+    family: str
+    weight: float
+    raw_daily_mean: float
+
+class DemandShapeResponse(BaseModel):
+    """
+    Relative demand shape for one day, per product family.
+
+    Weights are normalised to a mean of 1.0 on purpose. The simulator owns the
+    VOLUME -- each product's frozen baseline times the month's growth factor --
+    and this endpoint owns only the MIX between families. If the weights
+    averaged 1.3 the simulation would quietly run 30% hot and the 10% monthly
+    growth contract would stop holding.
+    """
+    shape_date: str
+    weights: List[FamilyWeight]
+    sentiment_multiplier: float
+    oil_price: float
+    generated_at: str

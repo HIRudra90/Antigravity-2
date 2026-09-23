@@ -1,8 +1,10 @@
+import math
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from app.models.schemas import (
     PipelineRequest, PipelineResponse, RevenueForecastRequest, RevenueForecastResponse,
     BacktestRequest, BacktestResponse, FamilyBacktest, MarketInsightResponse,
+    DemandShapeResponse, FamilyWeight,
 )
 from app.services.xgboost_forecast import forecast_demand
 from app.services.llm_sentiment import analyze_market
@@ -19,7 +21,7 @@ async def run_prediction_pipeline(request: PipelineRequest, background_tasks: Ba
     Unified AI Inventory Pipeline:
     1. Fetch live oil price (Yahoo Finance) + upcoming holidays
     2. Auto-fetch market news from NewsAPI if no market text provided
-    3. LLM analysis — single gpt-4o-mini call with oil + holidays + news context
+    3. LLM analysis â€” single gpt-4o-mini call with oil + holidays + news context
     4. XGBoost demand forecasting with real oil price
     5. PPO RL reorder decision
     6. Async log to Supabase
@@ -41,9 +43,9 @@ async def run_prediction_pipeline(request: PipelineRequest, background_tasks: Ba
             if market_context:
                 print(f"[Pipeline] Got {len(market_context)} chars of market news")
             else:
-                print("[Pipeline] No news found — scoring oil + holidays only")
+                print("[Pipeline] No news found â€” scoring oil + holidays only")
 
-        # Step 3: Decomposed market reading — deterministic oil/holiday scoring
+        # Step 3: Decomposed market reading â€” deterministic oil/holiday scoring
         # plus an LLM read of the headlines.
         market = analyze_market(market_context, oil, holidays)
         sentiment_multiplier = market["multiplier"]
@@ -113,10 +115,20 @@ async def revenue_forecast(body: RevenueForecastRequest):
     """
     Real XGBoost seasonal revenue forecast for the next 3 months.
 
-    Runs XGBoost 90 days forward across product families to extract the model's
-    seasonal signal (how Jun/Jul/Aug compare to the 90-day average), then scales
-    that signal to the caller's last actual monthly revenue. Applies real LLM
-    sentiment as the PPO+LLM adjustment layer.
+    Two separate components, which is the point:
+
+      LEVEL  a log-linear growth trend fitted to `revenue_history`, damped over
+             the horizon and scaled by how well it fits. This is where the
+             forecast's direction comes from.
+
+      SHAPE  XGBoost run 90 days forward across the product families, reduced
+             to how each month compares to the 90-day average. These factors
+             average to 1.0 by construction, so they redistribute the level
+             across the horizon without changing its total.
+
+    Sending no `revenue_history` leaves only the shape, and the forecast then
+    averages back to last month's revenue no matter what the business did --
+    which is what it used to do unconditionally.
     """
     try:
         oil = get_oil_context()
@@ -137,7 +149,7 @@ async def revenue_forecast(body: RevenueForecastRequest):
         total_90d: list[float] = []
         for family in families:
             daily = forecast_demand(
-                historical_sales=[20.0] * 12,   # dummy — real model ignores this
+                historical_sales=[20.0] * 12,   # dummy â€” real model ignores this
                 period="90d",
                 product_family=family,
                 oil_price=oil_price,
@@ -162,12 +174,77 @@ async def revenue_forecast(body: RevenueForecastRequest):
         f2 = round(m2 / avg_m, 4)
         f3 = round(m3 / avg_m, 4)
 
-        # Scale to actual business revenue
+        # ------------------------------------------------------------------
+        # Trend.
+        #
+        # This is what the forecast was missing entirely. f1/f2/f3 are each
+        # divided by their own mean, so they average to exactly 1.0 -- which
+        # means `last_rev * f` always averages back to last month's revenue no
+        # matter what the history did. The three-month forecast could only
+        # redistribute one month's figure across the horizon; it had no term
+        # capable of expressing growth at all. On a business compounding 10% a
+        # month it drew a September BELOW August, because September's seasonal
+        # factor happens to be 0.94, and that read as the AI predicting a
+        # downturn when it was predicting nothing.
+        #
+        # So the LEVEL now comes from the trend and XGBoost keeps supplying the
+        # SHAPE, which is the part it was always good for.
+        # ------------------------------------------------------------------
         last_rev = body.last_actual_revenue
-        if last_rev > 0:
-            xgboost = [round(last_rev * f1), round(last_rev * f2), round(last_rev * f3)]
+        hist = [h.revenue for h in (body.revenue_history or []) if h.revenue > 0]
+
+        growth, r2, trend_applied = 0.0, 0.0, False
+
+        # Four points is the minimum from which a slope means anything; below
+        # that a single odd month sets the direction.
+        if last_rev > 0 and len(hist) >= 4:
+            n = len(hist)
+            # Regress on ln(revenue), not revenue. The series compounds, so a
+            # straight-line fit systematically understates a growing business
+            # and overstates a shrinking one.
+            ys = [math.log(v) for v in hist]
+            xs = list(range(n))
+            mx = sum(xs) / n
+            my = sum(ys) / n
+            denom = sum((x - mx) ** 2 for x in xs)
+            if denom > 0:
+                slope = sum((xs[i] - mx) * (ys[i] - my) for i in range(n)) / denom
+                ss_tot = sum((y - my) ** 2 for y in ys)
+                ss_res = sum((ys[i] - (my + slope * (xs[i] - mx))) ** 2 for i in range(n))
+                r2 = (1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+                r2 = max(0.0, min(1.0, r2))
+
+                # Trust the trend in proportion to how well it actually fits.
+                # A clean series uses its slope almost in full; a noisy one
+                # collapses toward flat rather than extrapolating its own noise.
+                eff_slope = slope * r2
+                # And bound it, so one broken month in the data cannot produce
+                # a forecast nobody would believe.
+                eff_slope = max(math.log(0.85), min(math.log(1.25), eff_slope))
+
+                growth = math.exp(eff_slope) - 1.0
+                trend_applied = abs(eff_slope) > 1e-9
+
+                # Damped horizon (Gardner-McKenzie): month three gets phi + phi^2
+                # + phi^3 worth of growth rather than a full three months of it,
+                # so a three-month projection cannot run away.
+                phi = 0.9
+                levels = []
+                for i in range(3):
+                    damp = sum(phi ** k for k in range(i + 1))
+                    levels.append(last_rev * math.exp(eff_slope * damp))
+            else:
+                levels = [last_rev] * 3
         else:
-            xgboost = [0, 0, 0]
+            # No usable history: fall back to the original behaviour rather
+            # than refuse, so an older client still gets a forecast.
+            levels = [last_rev] * 3 if last_rev > 0 else [0.0, 0.0, 0.0]
+
+        xgboost = [
+            round(levels[0] * f1),
+            round(levels[1] * f2),
+            round(levels[2] * f3),
+        ]
 
         # PPO + LLM adjusted: apply real sentiment multiplier
         ppo_llm = [round(v * sentiment_mult) for v in xgboost]
@@ -179,6 +256,10 @@ async def revenue_forecast(body: RevenueForecastRequest):
             sentiment_analysis=sentiment_analysis,
             oil_price=round(oil_price, 2),
             seasonal_factors=[f1, f2, f3],
+            trend_monthly_growth=round(growth, 5),
+            trend_r2=round(r2, 4),
+            trend_applied=trend_applied,
+            trend_months_used=len(hist),
         )
 
     except Exception as e:
@@ -195,7 +276,7 @@ async def market_insight(family: str = "GROCERY I", product: str = "retail"):
     This exists because the dashboard was showing the mean `sentiment_multiplier`
     across all stored forecasts and calling it "Avg Market Sentiment". That is an
     average over how often someone pressed the button, not over market
-    conditions — 66 of 76 stored rows came from a single batch run on one day,
+    conditions â€” 66 of 76 stored rows came from a single batch run on one day,
     so the figure was frozen at that day's reading and could never move.
 
     This returns what the market looks like RIGHT NOW, decomposed, so the number
@@ -332,3 +413,100 @@ async def backtest(body: BacktestRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Backtest failed: {str(e)}")
+
+
+@router.get("/simulate/demand-shape", response_model=DemandShapeResponse)
+async def demand_shape(families: str = "GROCERY I,BEVERAGES,DAIRY,PRODUCE,FROZEN FOODS"):
+    """
+    Today's relative demand shape per product family, for the sales simulator.
+
+    The simulator in Postgres owns how MUCH sells: each product's frozen
+    baseline times the month's growth factor. This endpoint owns only the MIX
+    -- which families are running hot or cold today, according to XGBoost's
+    seasonal signal and the live market reading.
+
+    That split is why the weights are normalised to a mean of exactly 1.0. If
+    they averaged 1.3, total volume would silently run 30% above baseline and
+    the 10%-per-month growth contract would stop holding. Normalising lets the
+    mix move freely while leaving the volume exactly where the simulator set
+    it.
+
+    The caller treats this as a cache, never a dependency: this Space sleeps on
+    free cpu-basic, and a tick that cannot reach it falls back to a flat 1.0
+    weight and carries on.
+    """
+    try:
+        # Pipe-separated, because family names are not comma-safe: this
+        # catalogue contains "LIQUOR,WINE,BEER", which a comma split tears into
+        # three families that do not exist, so its products never received a
+        # weight. Comma is still accepted when no pipe is present, so an older
+        # caller keeps working.
+        #
+        # The catalogue carries 33 families. Capping at 8, as this first did,
+        # meant 25 of them silently fell back to a flat 1.0 -- and which 8 got
+        # a real weight depended on nothing but string order. A family costs
+        # ~0.32s to forecast, so covering all of them takes ~10s, well inside
+        # the caller's 55s deadline for a once-a-day job.
+        sep = "|" if "|" in families else ","
+        fam_list = [f.strip() for f in families.split(sep) if f.strip()][:40]
+        if not fam_list:
+            fam_list = ["GROCERY I"]
+
+        oil = get_oil_context()
+        oil_price = oil["price"]
+        holidays = get_upcoming_holidays(30)
+        market = analyze_market(
+            fetch_market_news_detailed("retail", fam_list[0])["text"], oil, holidays,
+        )
+        sentiment_mult = market["multiplier"]
+
+        # One 30-day run per family; the mean daily rate is that family's level.
+        means: dict[str, float] = {}
+        for family in fam_list:
+            daily = forecast_demand(
+                historical_sales=[20.0] * 12,   # dummy -- the real model ignores this
+                period="30d",
+                product_family=family,
+                oil_price=oil_price,
+            )[:30]
+            means[family] = (sum(daily) / len(daily)) if daily else 1.0
+
+        overall = sum(means.values()) / len(means) if means else 1.0
+        if overall <= 0:
+            overall = 1.0
+
+        # Normalise to mean 1.0 and clamp, so a family the model is wild about
+        # tilts the mix rather than emptying its shelves in an afternoon.
+        #
+        # These two goals fight each other, and the order matters. Clamping
+        # last breaks the mean; rescaling last breaks the clamp -- which is
+        # what happened first time round and produced a 1.59 weight against a
+        # stated 1.40 ceiling. Alternating converges on both: rescaling pulls
+        # the mean back to 1.0, clamping pulls outliers back in, and each pass
+        # leaves less for the next to do. Four is well past convergence for a
+        # realistic spread.
+        LO, HI = 0.70, 1.40
+        vals = {f: m / overall for f, m in means.items()}
+        for _ in range(4):
+            mean_v = sum(vals.values()) / len(vals)
+            if mean_v <= 0:
+                break
+            vals = {f: max(LO, min(HI, v / mean_v)) for f, v in vals.items()}
+
+        weights = [
+            FamilyWeight(family=f, weight=round(v, 4), raw_daily_mean=round(means[f], 3))
+            for f, v in vals.items()
+        ]
+
+        return DemandShapeResponse(
+            shape_date=datetime.utcnow().date().isoformat(),
+            weights=weights,
+            sentiment_multiplier=round(sentiment_mult, 4),
+            oil_price=round(oil_price, 2),
+            generated_at=datetime.utcnow().isoformat(),
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Demand shape failed: {str(e)}")
