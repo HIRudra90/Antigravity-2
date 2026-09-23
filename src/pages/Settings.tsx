@@ -146,7 +146,6 @@ export default function Settings() {
   const [invLoading,   setInvLoading]   = useState(false)
 
   // ── Simulation harness (migrations 036/037) ─────────────────────────────
-  const [simDays,    setSimDays]    = useState(7)
   const [simRunning, setSimRunning] = useState(false)
   const [simRows,    setSimRows]    = useState<any[]>([])
   const [simError,   setSimError]   = useState<string | null>(null)
@@ -252,26 +251,30 @@ export default function Settings() {
   }, [activeTab])
 
   /**
-   * Advances the clock by N days of real sales, with stock drawing down.
+   * Runs one tick of live sales immediately, instead of waiting for the hour.
    *
-   * This writes rows — it is a test harness, not a preview. Sales land in
-   * sales_transactions, stock falls, revenue and the cash ledger move, and
-   * products that cross their reorder point fire the restock agent through
-   * the existing trg_low_stock webhook.
+   * This used to call simulate_sales_days, which advanced the clock by whole
+   * days dated forward from the last sale. That is what pushed the data two
+   * months ahead of the calendar and broke every date-anchored view — the
+   * forecast chart ended up drawing a September forecast against September
+   * actuals that already existed. Migration 050 retires that function; the
+   * button now drives the same tick pg_cron runs hourly.
+   *
+   * It still writes real rows: stock falls, cash moves, and products crossing
+   * their reorder point fire the restock agent. The difference is that the
+   * sales are dated today, so nothing can run ahead of the calendar.
    */
-  async function runSimulation(days: number) {
+  async function runSimulation() {
     if (simRunning) return
     setSimRunning(true); setSimError(null)
     try {
-      const { data, error } = await supabase.rpc('simulate_sales_days', {
-        p_days: days, p_multiplier: 1.0,
-      })
+      const { data, error } = await supabase.rpc('tick_realtime_sales', { p_dry_run: false })
       if (error) throw error
       setSimRows((data as any[]) || [])
       // Stock and reorder state have moved, so the product table beneath is stale.
       setInvProducts([]); loadInvProducts()
     } catch (e: any) {
-      setSimError(e?.message || 'The simulation could not run.')
+      setSimError(e?.message || 'The tick could not run.')
     } finally {
       setSimRunning(false)
     }
@@ -885,7 +888,7 @@ export default function Settings() {
                 </button>
               </div>
               <div style={{ display: 'flex', gap: 6, marginBottom: 24, background: 'rgba(255,255,255,0.04)', padding: 4, borderRadius: 'var(--r-md)', border: '1px solid var(--clr-border)', width: 'fit-content' }}>
-                {([{ id: 'sale', label: 'Record Sale', icon: ShoppingCart }, { id: 'stock', label: 'Manage Stock', icon: Edit3 }, { id: 'simulate', label: 'Simulate Days', icon: Calendar }] as const).map(t => (
+                {([{ id: 'sale', label: 'Record Sale', icon: ShoppingCart }, { id: 'stock', label: 'Manage Stock', icon: Edit3 }, { id: 'simulate', label: 'Live Sales', icon: Calendar }] as const).map(t => (
                   <button key={t.id} onClick={() => setInvSubTab(t.id)} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 14px', borderRadius: 'calc(var(--r-md) - 2px)', fontSize: 13, fontWeight: 600, border: 'none', cursor: 'pointer', transition: 'all 0.2s', background: invSubTab === t.id ? 'linear-gradient(135deg,#6C63FF,#846cff)' : 'transparent', color: invSubTab === t.id ? '#fff' : 'var(--clr-text-muted)' }}
                     onMouseEnter={e => { if (invSubTab !== t.id) (e.currentTarget as HTMLElement).style.boxShadow = '0 0 0 1px rgba(108,99,255,0.4), 0 0 12px rgba(108,99,255,0.3)' }}
                     onMouseLeave={e => { (e.currentTarget as HTMLElement).style.boxShadow = '' }}
@@ -896,37 +899,21 @@ export default function Settings() {
               {invSubTab === 'simulate' && (
                 <div style={{ maxWidth: 760 }}>
                   <p style={{ fontSize: 13, color: 'var(--clr-text-muted)', marginBottom: 6, lineHeight: 1.6 }}>
-                    Advances the clock by whole days of realistic sales, drawn from each product&rsquo;s own
-                    demand. Stock falls, revenue and cash move, and products cross their reorder points on
-                    different days &mdash; so the restock agent can be watched behaving normally instead of
-                    reacting to the whole catalogue at once.
+                    Sales run continuously. pg_cron ticks every hour, drawing each product&rsquo;s own demand
+                    from its frozen baseline, so stock falls, revenue and cash move, and products cross their
+                    reorder points on different days &mdash; the restock agent can be watched behaving
+                    normally instead of reacting to the whole catalogue at once.
                   </p>
                   <p style={{ fontSize: 12, color: '#f59e0b', marginBottom: 18, lineHeight: 1.6 }}>
-                    This writes real rows. Simulated days are dated forward from the last sale, so they can
-                    run ahead of today&rsquo;s date &mdash; that is what fast-forwarding means.
+                    This writes real rows, dated today. The tick is time-proportional, so running one by hand
+                    sells whatever has accrued since the last tick rather than a fixed amount &mdash; run it
+                    twice in a row and the second will be close to nothing.
                   </p>
 
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 16 }}>
-                    {[1, 7, 30].map(d => (
-                      <button key={d} className="btn btn-ghost" disabled={simRunning}
-                        onClick={() => { setSimDays(d); runSimulation(d) }}
-                        style={{ opacity: simRunning ? 0.5 : 1 }}>
-                        <Calendar size={14} /> Advance {d} day{d === 1 ? '' : 's'}
-                      </button>
-                    ))}
-                    <span style={{ width: 1, height: 26, background: 'rgba(255,255,255,0.12)' }} />
-                    {/* Capped at 60: a signed-in session carries
-                        statement_timeout=8s and a run costs ~0.12s per
-                        simulated day, so longer would abort partway and leave
-                        some days written and others not. */}
-                    <input
-                      type="number" min={1} max={60} value={simDays}
-                      onChange={e => setSimDays(Math.max(1, Math.min(60, Number(e.target.value) || 1)))}
-                      className="glass-input" style={{ width: 74, fontSize: 13, padding: '7px 10px' }}
-                    />
                     <button className="btn btn-primary" disabled={simRunning}
-                      onClick={() => runSimulation(simDays)}>
-                      {simRunning ? 'Running…' : `Run ${simDays} days`}
+                      onClick={() => runSimulation()}>
+                      {simRunning ? 'Running…' : 'Run a tick now'}
                     </button>
                     <span style={{ width: 1, height: 26, background: 'rgba(255,255,255,0.12)' }} />
                     <button className="btn btn-ghost" disabled={simRunning} onClick={reshuffleCycle}
@@ -947,34 +934,26 @@ export default function Settings() {
                       <table className="data-table">
                         <thead>
                           <tr>
-                            <th>Day</th><th>Units sold</th><th>Revenue</th>
-                            <th>Delivered</th><th>Units received</th>
-                            <th>Lost to stockout</th><th>Crossed reorder</th>
+                            <th>Date</th><th>Hours of demand</th><th>Products</th>
+                            <th>Units sold</th><th>Lost to stockout</th><th>Note</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {simRows.map((r: any) => (
-                            <tr key={r.day}>
-                              <td style={{ whiteSpace: 'nowrap' }}>{r.day}</td>
-                              <td>{Number(r.units_sold).toLocaleString()}</td>
-                              <td style={{ color: '#22d3a8', fontWeight: 600 }}>{locale.moneyShort(Number(r.revenue))}</td>
-                              {/* Deliveries are the half of the cycle the
-                                  simulator originally lacked: without them
-                                  stock only ever fell. */}
-                              <td style={{ color: Number(r.delivered) > 0 ? '#a78bfa' : 'var(--clr-text-muted)', fontWeight: Number(r.delivered) > 0 ? 700 : 400 }}>
-                                {r.delivered}
-                              </td>
-                              <td style={{ color: Number(r.units_received) > 0 ? '#a78bfa' : 'var(--clr-text-muted)' }}>
-                                {Number(r.units_received).toLocaleString()}
-                              </td>
+                          {simRows.map((r: any, i: number) => (
+                            <tr key={`${r.tick_date}-${i}`}>
+                              <td style={{ whiteSpace: 'nowrap' }}>{r.tick_date}</td>
+                              {/* The tick bills for elapsed time, not for a
+                                  fixed slice, so this is how much demand the
+                                  run actually represented. */}
+                              <td>{Number(r.elapsed_hours).toFixed(2)}h</td>
+                              <td>{Number(r.rows_written).toLocaleString()}</td>
+                              <td style={{ color: '#22d3a8', fontWeight: 600 }}>{Number(r.units_sold).toLocaleString()}</td>
                               {/* Unmet demand is the point of the exercise: it is
                                   what a reorder level set too low actually costs. */}
                               <td style={{ color: Number(r.lost_units) > 0 ? '#f43f5e' : 'var(--clr-text-muted)', fontWeight: Number(r.lost_units) > 0 ? 700 : 400 }}>
                                 {Number(r.lost_units).toLocaleString()}
                               </td>
-                              <td style={{ color: Number(r.crossed_reorder) > 0 ? '#f59e0b' : 'var(--clr-text-muted)' }}>
-                                {r.crossed_reorder}
-                              </td>
+                              <td style={{ color: 'var(--clr-text-muted)', fontSize: 12 }}>{r.note}</td>
                             </tr>
                           ))}
                         </tbody>
